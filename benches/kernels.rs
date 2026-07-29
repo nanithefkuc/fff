@@ -53,6 +53,50 @@ fn bench(label: &str, bytes: usize, mut body: impl FnMut()) {
     println!("  {label:<44} {:>9.2?}  {gib_per_sec:>7.2} GiB/s", median);
 }
 
+/// Payload lengths used by network-facing consumers.
+///
+/// The run around 1,200 bytes alternates exact 32-byte lanes with 16-byte
+/// remainders so SIMD tail cliffs stay visible.
+const NETWORK_LENGTHS: &[usize] = &[
+    64, 256, 512, 1_152, 1_168, 1_184, 1_200, 1_216, 1_232, 1_248, 1_400,
+];
+
+fn bench_network_payloads() {
+    println!("network-size GF(2^8) payloads:");
+    for &len in NETWORK_LENGTHS {
+        println!("  payload {len} B:");
+        let src = noise(len, 0x700 + len as u64);
+        let mut dst = noise(len, 0x800 + len as u64);
+
+        bench("xor", len, || {
+            ops::add_assign::<Gf8>(black_box(&mut dst), black_box(&src));
+        });
+        bench("mul_add", len, || {
+            ops::mul_add::<Gf8>(black_box(&mut dst), gf8::Elem(0x53), black_box(&src));
+        });
+        bench("mul_assign", len, || {
+            ops::mul_assign::<Gf8>(black_box(&mut dst), gf8::Elem(0x53));
+        });
+
+        for nrows in [4usize, 16] {
+            let coeffs: Vec<_> = (0..nrows)
+                .map(|row| gf8::Elem((row as u8).wrapping_mul(37).wrapping_add(2)))
+                .collect();
+            let mut rows = noise(len * nrows, 0x900 + nrows as u64);
+            let label = format!("scatter ({nrows} rows)");
+            bench(&label, len * nrows, || {
+                ops::mul_add_scatter::<Gf8>(
+                    black_box(&mut rows),
+                    len,
+                    black_box(&coeffs),
+                    black_box(&src),
+                );
+            });
+        }
+    }
+    println!();
+}
+
 fn main() {
     println!("fff kernel benchmark — backend: {}", backend().name());
     println!("  (override with FFF_BACKEND=avx512|gfni|avx2|ssse3|neon|scalar)\n");
@@ -79,6 +123,8 @@ fn main() {
         );
     });
     println!();
+
+    bench_network_payloads();
 
     // L1-resident, L2-resident, and DRAM-resident.
     for &len in &[4 * 1024usize, 256 * 1024, 8 * 1024 * 1024] {
