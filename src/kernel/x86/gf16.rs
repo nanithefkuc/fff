@@ -14,11 +14,11 @@
 //!
 //! - **GFNI** does each byte multiply with `GF2P8MULB` and gets the two
 //!   alternating coefficients straight out of
-//!   [`TowerCoeff`](crate::kernel::tables::TowerCoeff) — one `vpbroadcastw`
+//!   [`TowerCoeff`] — one `vpbroadcastw`
 //!   each, no table at all.
 //! - **AVX2 / SSSE3** have no field multiply, so each of the four base-field
 //!   factors becomes a split-nibble `PSHUFB` pair against
-//!   [`TowerTables`](crate::kernel::tables::TowerTables); the even and odd
+//!   [`TowerTables`]; the even and odd
 //!   byte lanes are then selected with a `0x00ff` halfword mask.
 //!
 //! The multi-row kernels are GFNI-only: without a native byte multiply the

@@ -12,7 +12,7 @@
 //! `b` is `a`'s adjacent-byte neighbour, so the crossed half is the same
 //! alternating byte multiply applied to `vrev16q_u8(source)`, and the four
 //! base coefficients are exactly
-//! [`TowerTables::factors`](crate::kernel::tables::TowerTables::factors).
+//! [`TowerTables::factors`].
 //!
 //! NEON has no byte-wide field multiply, so each base coefficient is a
 //! split-nibble `vqtbl1q_u8` pair — two lookups and an XOR. A whole 16-byte
@@ -39,7 +39,7 @@ const TERM_BLOCK: usize = 8;
 /// The eight lookup vectors one GF(2^16) coefficient needs.
 ///
 /// `lo[i]` and `hi[i]` are the nibble tables of
-/// [`TowerTables::factors`](crate::kernel::tables::TowerTables::factors)`[i]`,
+/// [`TowerTables::factors`]`[i]`,
 /// that is of `[c0, c0+c1, DELTA*c1, c1]`.
 #[derive(Clone, Copy)]
 struct Factors {
