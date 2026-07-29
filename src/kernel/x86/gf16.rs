@@ -30,8 +30,11 @@ use crate::kernel::Matrix;
 use crate::kernel::gf16::{Prepared, mul_add_scalar, mul_assign_scalar, mul_into_scalar};
 use crate::kernel::tables::{TowerCoeff, TowerTables};
 
-pub(crate) trait TableCoefficient {
+/// A GF(2^16) coefficient in a form the shuffle kernels can consume.
+pub trait TableCoefficient {
+    /// The raw coefficient element.
     fn coefficient(&self) -> Elem;
+    /// Borrow the four nibble tables, building them on the fly if needed.
     fn with_tables<R>(&self, consume: impl FnOnce(&TowerTables) -> R) -> R;
 }
 
@@ -133,7 +136,7 @@ fn scale_gfni(src: __m256i, swapped: __m256i, same: __m256i, cross: __m256i) -> 
 }
 
 /// `dst ^= coeff * src` with `GF2P8MULB` over 32-byte lanes.
-pub(crate) fn mul_add_gfni(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
+pub fn mul_add_gfni(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the GFNI backend, so AVX2 and GFNI are
     // present; `dst` and `src` are separately borrowed slices.
@@ -196,7 +199,7 @@ unsafe fn mul_add_gfni_impl(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
 }
 
 /// `dst = coeff * dst` with `GF2P8MULB` over 32-byte lanes.
-pub(crate) fn mul_assign_gfni(dst: &mut [u8], coeff: TowerCoeff) {
+pub fn mul_assign_gfni(dst: &mut [u8], coeff: TowerCoeff) {
     // SAFETY: the caller selected the GFNI backend, so AVX2 and GFNI are
     // present.
     unsafe { mul_assign_gfni_impl(dst, coeff) }
@@ -233,7 +236,7 @@ unsafe fn mul_assign_gfni_impl(dst: &mut [u8], coeff: TowerCoeff) {
 ///
 /// Fused form of copy-then-scale: the `mul_add` body without the destination
 /// read, one pass.
-pub(crate) fn mul_into_gfni(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
+pub fn mul_into_gfni(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the GFNI backend, so AVX2 and GFNI are
     // present; `dst` and `src` are separately borrowed slices.
@@ -369,7 +372,7 @@ fn scale_avx2(src: __m256i, tables: &NibbleAvx2) -> __m256i {
 }
 
 /// `dst ^= coeff * src` with `PSHUFB` lookups over 32-byte lanes.
-pub(crate) fn mul_add_avx2(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
+pub fn mul_add_avx2(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the AVX2 backend; `dst` and `src` are
     // separately borrowed slices.
@@ -399,7 +402,7 @@ unsafe fn mul_add_avx2_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
 }
 
 /// `dst = coeff * dst` with `PSHUFB` lookups over 32-byte lanes.
-pub(crate) fn mul_assign_avx2(dst: &mut [u8], tables: &TowerTables) {
+pub fn mul_assign_avx2(dst: &mut [u8], tables: &TowerTables) {
     // SAFETY: the caller selected the AVX2 backend.
     unsafe { mul_assign_avx2_impl(dst, tables) }
 }
@@ -429,7 +432,7 @@ unsafe fn mul_assign_avx2_impl(dst: &mut [u8], tables: &TowerTables) {
 ///
 /// Fused form of copy-then-scale: the `mul_add` body without the destination
 /// read, one pass.
-pub(crate) fn mul_into_avx2(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
+pub fn mul_into_avx2(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the AVX2 backend; `dst` and `src` are
     // separately borrowed slices.
@@ -531,7 +534,7 @@ fn scale_ssse3(src: __m128i, tables: &NibbleSsse3) -> __m128i {
 }
 
 /// `dst ^= coeff * src` with `PSHUFB` lookups over 16-byte lanes.
-pub(crate) fn mul_add_ssse3(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
+pub fn mul_add_ssse3(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the SSSE3 backend; `dst` and `src` are
     // separately borrowed slices.
@@ -561,7 +564,7 @@ unsafe fn mul_add_ssse3_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
 }
 
 /// `dst = coeff * dst` with `PSHUFB` lookups over 16-byte lanes.
-pub(crate) fn mul_assign_ssse3(dst: &mut [u8], tables: &TowerTables) {
+pub fn mul_assign_ssse3(dst: &mut [u8], tables: &TowerTables) {
     // SAFETY: the caller selected the SSSE3 backend.
     unsafe { mul_assign_ssse3_impl(dst, tables) }
 }
@@ -591,7 +594,7 @@ unsafe fn mul_assign_ssse3_impl(dst: &mut [u8], tables: &TowerTables) {
 ///
 /// Fused form of copy-then-scale: the `mul_add` body without the destination
 /// read, one pass.
-pub(crate) fn mul_into_ssse3(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
+pub fn mul_into_ssse3(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the SSSE3 backend; `dst` and `src` are
     // separately borrowed slices.
@@ -627,7 +630,7 @@ unsafe fn mul_into_ssse3_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) 
 /// Coefficients of zero and one need no special case: `TowerCoeff` reduces
 /// them to the broadcast pairs `(0, 0)` and `(0x0101, 0)`, which the same
 /// multiply turns into a no-op and a plain XOR respectively.
-pub(crate) fn scatter_gfni(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
+pub fn scatter_gfni(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
     debug_assert_eq!(row_len, src.len());
     if row_len == 0 {
         return;
@@ -743,16 +746,12 @@ unsafe fn scatter_group_gfni<const N: usize>(
 /// every term of a block is folded in, and the tile is stored once. The
 /// non-blocked shape re-streams each destination row per term, which is what
 /// dominates once `nrows * row_len` leaves L1.
-pub(crate) fn matrix_gfni(
-    rows: &mut [u8],
-    row_len: usize,
-    nrows: usize,
-    terms: &[(&[Elem], &[u8])],
-) {
+pub fn matrix_gfni(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
     matrix_gfni_with(rows, row_len, nrows, terms);
 }
 
-pub(crate) fn matrix_gfni_with<M: Matrix<Elem> + ?Sized>(
+/// Many sources into many rows, GFNI backend, over a generic matrix source.
+pub fn matrix_gfni_with<M: Matrix<Elem> + ?Sized>(
     rows: &mut [u8],
     row_len: usize,
     nrows: usize,
@@ -893,7 +892,7 @@ unsafe fn matrix_group_gfni<const N: usize, M: Matrix<Elem> + ?Sized>(
 // ---------------------------------------------------------------------------
 
 /// `dst[i] = a[i] * b[i]` over interleaved tower elements using GFNI.
-pub(crate) fn elementwise_gfni(dst: &mut [u8], a: &[u8], b: &[u8]) {
+pub fn elementwise_gfni(dst: &mut [u8], a: &[u8], b: &[u8]) {
     debug_assert_eq!(dst.len(), a.len());
     debug_assert_eq!(dst.len(), b.len());
     // SAFETY: the selected backend guarantees AVX2 and GFNI.
@@ -947,7 +946,7 @@ const TERM_TILE: usize = 8;
 
 /// Many sources into one destination, eight coefficients prepared per pass.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn gather_avx2<C: TableCoefficient>(dst: &mut [u8], coeffs: &[C], srcs: &[&[u8]]) {
+pub fn gather_avx2<C: TableCoefficient>(dst: &mut [u8], coeffs: &[C], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
     // SAFETY: the selected backend guarantees AVX2.
     unsafe { gather_avx2_impl(dst, coeffs, srcs) }
@@ -987,7 +986,7 @@ unsafe fn gather_avx2_impl<C: TableCoefficient>(dst: &mut [u8], coeffs: &[C], sr
 }
 
 /// Many sources into one destination, eight coefficients prepared per pass.
-pub(crate) fn gather_ssse3<C: TableCoefficient>(dst: &mut [u8], coeffs: &[C], srcs: &[&[u8]]) {
+pub fn gather_ssse3<C: TableCoefficient>(dst: &mut [u8], coeffs: &[C], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
     // SAFETY: the selected backend guarantees SSSE3.
     unsafe { gather_ssse3_impl(dst, coeffs, srcs) }
@@ -1028,7 +1027,7 @@ unsafe fn gather_ssse3_impl<C: TableCoefficient>(dst: &mut [u8], coeffs: &[C], s
 /// GFNI gather: all coefficients remain compact, so one pass can fold every
 /// source without term blocking.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn gather_gfni(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
+pub fn gather_gfni(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
     // SAFETY: the selected backend guarantees AVX2 and GFNI.
     unsafe { gather_gfni_impl(dst, coeffs, srcs) }
@@ -1065,7 +1064,7 @@ unsafe fn gather_gfni_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
 }
 
 /// One source into many rows using four AVX2 table sets at a time.
-pub(crate) fn scatter_avx2<C: TableCoefficient>(
+pub fn scatter_avx2<C: TableCoefficient>(
     rows: &mut [u8],
     row_len: usize,
     coeffs: &[C],
@@ -1125,7 +1124,7 @@ unsafe fn scatter_avx2_impl<C: TableCoefficient>(
 }
 
 /// One source into many rows using four SSSE3 table sets at a time.
-pub(crate) fn scatter_ssse3<C: TableCoefficient>(
+pub fn scatter_ssse3<C: TableCoefficient>(
     rows: &mut [u8],
     row_len: usize,
     coeffs: &[C],
@@ -1183,16 +1182,12 @@ unsafe fn scatter_ssse3_impl<C: TableCoefficient>(
 
 /// Many sources into many rows using AVX2 nibble shuffles.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn matrix_avx2(
-    rows: &mut [u8],
-    row_len: usize,
-    nrows: usize,
-    terms: &[(&[Elem], &[u8])],
-) {
+pub fn matrix_avx2(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
     matrix_avx2_with(rows, row_len, nrows, terms);
 }
 
-pub(crate) fn matrix_avx2_with<C: TableCoefficient, M: Matrix<C> + ?Sized>(
+/// Many sources into many rows, AVX2 backend, over a generic matrix source.
+pub fn matrix_avx2_with<C: TableCoefficient, M: Matrix<C> + ?Sized>(
     rows: &mut [u8],
     row_len: usize,
     nrows: usize,
@@ -1272,16 +1267,12 @@ unsafe fn matrix_avx2_impl<C: TableCoefficient, M: Matrix<C> + ?Sized>(
 }
 
 /// Many sources into many rows using SSSE3 nibble shuffles.
-pub(crate) fn matrix_ssse3(
-    rows: &mut [u8],
-    row_len: usize,
-    nrows: usize,
-    terms: &[(&[Elem], &[u8])],
-) {
+pub fn matrix_ssse3(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
     matrix_ssse3_with(rows, row_len, nrows, terms);
 }
 
-pub(crate) fn matrix_ssse3_with<C: TableCoefficient, M: Matrix<C> + ?Sized>(
+/// Many sources into many rows, SSSE3 backend, over a generic matrix source.
+pub fn matrix_ssse3_with<C: TableCoefficient, M: Matrix<C> + ?Sized>(
     rows: &mut [u8],
     row_len: usize,
     nrows: usize,

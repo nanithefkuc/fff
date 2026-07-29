@@ -29,7 +29,17 @@ use crate::kernel::x86;
 /// Two table reads and two XORs per byte, versus a log/antilog pair with a
 /// modular reduction. Also the tail handler for every vector kernel, which is
 /// why it takes the already-built table rather than a coefficient.
+#[cfg(feature = "internals")]
+pub fn mul_add_nibble(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+    mul_add_nibble_impl(dst, table, src);
+}
+
+#[cfg(not(feature = "internals"))]
 pub(crate) fn mul_add_nibble(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+    mul_add_nibble_impl(dst, table, src);
+}
+
+fn mul_add_nibble_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     for (d, &s) in dst.iter_mut().zip(src) {
         *d ^= table.lo[(s & 0x0f) as usize] ^ table.hi[(s >> 4) as usize];
@@ -37,7 +47,17 @@ pub(crate) fn mul_add_nibble(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
 }
 
 /// `dst *= coeff` via split-nibble lookup.
+#[cfg(feature = "internals")]
+pub fn mul_assign_nibble(dst: &mut [u8], table: &ScaleTable) {
+    mul_assign_nibble_impl(dst, table);
+}
+
+#[cfg(not(feature = "internals"))]
 pub(crate) fn mul_assign_nibble(dst: &mut [u8], table: &ScaleTable) {
+    mul_assign_nibble_impl(dst, table);
+}
+
+fn mul_assign_nibble_impl(dst: &mut [u8], table: &ScaleTable) {
     for d in dst.iter_mut() {
         *d = table.lo[(*d & 0x0f) as usize] ^ table.hi[(*d >> 4) as usize];
     }
@@ -47,7 +67,17 @@ pub(crate) fn mul_assign_nibble(dst: &mut [u8], table: &ScaleTable) {
 ///
 /// Tail handler for the fused out-of-place kernels, mirroring
 /// [`mul_add_nibble`].
+#[cfg(feature = "internals")]
+pub fn mul_into_nibble(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+    mul_into_nibble_impl(dst, table, src);
+}
+
+#[cfg(not(feature = "internals"))]
 pub(crate) fn mul_into_nibble(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+    mul_into_nibble_impl(dst, table, src);
+}
+
+fn mul_into_nibble_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     for (d, &s) in dst.iter_mut().zip(src) {
         *d = table.lo[(s & 0x0f) as usize] ^ table.hi[(s >> 4) as usize];

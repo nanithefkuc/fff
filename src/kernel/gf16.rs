@@ -56,7 +56,17 @@ impl Prepared {
 /// `dst ^= coeff * src` over interleaved elements, one element at a time.
 ///
 /// The tail handler for the vector kernels.
+#[cfg(feature = "internals")]
+pub fn mul_add_scalar(dst: &mut [u8], coeff: Elem, src: &[u8]) {
+    mul_add_scalar_impl(dst, coeff, src);
+}
+
+#[cfg(not(feature = "internals"))]
 pub(crate) fn mul_add_scalar(dst: &mut [u8], coeff: Elem, src: &[u8]) {
+    mul_add_scalar_impl(dst, coeff, src);
+}
+
+fn mul_add_scalar_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     for (d, s) in dst.chunks_exact_mut(2).zip(src.chunks_exact(2)) {
         let product = Elem::from_bytes([s[0], s[1]]).mul(coeff);
@@ -66,7 +76,17 @@ pub(crate) fn mul_add_scalar(dst: &mut [u8], coeff: Elem, src: &[u8]) {
 }
 
 /// `dst *= coeff` over interleaved elements, one element at a time.
+#[cfg(feature = "internals")]
+pub fn mul_assign_scalar(dst: &mut [u8], coeff: Elem) {
+    mul_assign_scalar_impl(dst, coeff);
+}
+
+#[cfg(not(feature = "internals"))]
 pub(crate) fn mul_assign_scalar(dst: &mut [u8], coeff: Elem) {
+    mul_assign_scalar_impl(dst, coeff);
+}
+
+fn mul_assign_scalar_impl(dst: &mut [u8], coeff: Elem) {
     for d in dst.chunks_exact_mut(2) {
         let value = Elem::from_bytes([d[0], d[1]]).mul(coeff);
         d.copy_from_slice(&value.to_bytes());
@@ -77,8 +97,18 @@ pub(crate) fn mul_assign_scalar(dst: &mut [u8], coeff: Elem) {
 ///
 /// Tail handler for the fused out-of-place vector kernels, mirroring
 /// [`mul_add_scalar`] without the destination read.
+#[cfg(feature = "internals")]
+pub fn mul_into_scalar(dst: &mut [u8], coeff: Elem, src: &[u8]) {
+    mul_into_scalar_impl(dst, coeff, src);
+}
+
+#[cfg(not(feature = "internals"))]
 #[allow(dead_code)]
 pub(crate) fn mul_into_scalar(dst: &mut [u8], coeff: Elem, src: &[u8]) {
+    mul_into_scalar_impl(dst, coeff, src);
+}
+
+fn mul_into_scalar_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     for (d, s) in dst.chunks_exact_mut(2).zip(src.chunks_exact(2)) {
         let product = Elem::from_bytes([s[0], s[1]]).mul(coeff);

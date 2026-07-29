@@ -10,8 +10,8 @@
 
 #![allow(unsafe_code)]
 
-pub(crate) mod gf16;
-pub(crate) mod gf8;
+pub mod gf16;
+pub mod gf8;
 
 use core::arch::aarch64::*;
 
@@ -21,7 +21,7 @@ use crate::kernel::scalar;
 ///
 /// # Panics
 /// Panics if the slices differ in length.
-pub(crate) fn xor_neon(dst: &mut [u8], src: &[u8]) {
+pub fn xor_neon(dst: &mut [u8], src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: NEON is baseline on AArch64; the slices are equal-length and
     // independently borrowed.

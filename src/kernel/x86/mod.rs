@@ -18,9 +18,9 @@
 #![allow(unsafe_code)]
 #![allow(clippy::incompatible_msrv)]
 
-pub(crate) mod avx512;
-pub(crate) mod gf16;
-pub(crate) mod gf8;
+pub mod avx512;
+pub mod gf16;
+pub mod gf8;
 
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
@@ -33,7 +33,7 @@ use crate::kernel::scalar;
 ///
 /// # Panics
 /// Panics if the slices differ in length.
-pub(crate) fn xor_avx2(dst: &mut [u8], src: &[u8]) {
+pub fn xor_avx2(dst: &mut [u8], src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected an AVX2-capable backend, and the slices are
     // equal-length and independently borrowed.
@@ -72,7 +72,7 @@ unsafe fn xor_avx2_impl(dst: &mut [u8], src: &[u8]) {
 ///
 /// # Panics
 /// Panics if the slices differ in length.
-pub(crate) fn xor_sse2(dst: &mut [u8], src: &[u8]) {
+pub fn xor_sse2(dst: &mut [u8], src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: SSE2 is baseline on x86_64 and implied by the SSSE3 backend on
     // x86; the slices are equal-length and independently borrowed.

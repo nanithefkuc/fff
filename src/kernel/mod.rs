@@ -15,19 +15,60 @@
 //! Callers should use the safe, validated wrappers in [`crate::ops`] rather
 //! than this module directly.
 
+#[cfg(feature = "internals")]
+pub mod fan_paar;
+#[cfg(not(feature = "internals"))]
 pub(crate) mod fan_paar;
+
+#[cfg(feature = "internals")]
+pub mod gf16;
+#[cfg(not(feature = "internals"))]
 pub(crate) mod gf16;
+
+#[cfg(feature = "internals")]
+pub mod gf32;
+#[cfg(not(feature = "internals"))]
 pub(crate) mod gf32;
+
+#[cfg(feature = "internals")]
+pub mod gf64;
+#[cfg(not(feature = "internals"))]
 pub(crate) mod gf64;
+
+#[cfg(feature = "internals")]
+pub mod gf8;
+#[cfg(not(feature = "internals"))]
 pub(crate) mod gf8;
+
+#[cfg(feature = "internals")]
+pub mod scalar;
+#[cfg(not(feature = "internals"))]
 pub(crate) mod scalar;
+
+#[cfg(feature = "internals")]
+pub mod tables;
+#[cfg(not(feature = "internals"))]
 pub(crate) mod tables;
 
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[cfg(feature = "internals")]
+pub mod aarch64;
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[cfg(not(feature = "internals"))]
 pub(crate) mod aarch64;
+
 #[cfg(all(feature = "simd", target_arch = "wasm32"))]
+#[cfg(feature = "internals")]
+pub mod wasm32;
+#[cfg(all(feature = "simd", target_arch = "wasm32"))]
+#[cfg(not(feature = "internals"))]
 pub(crate) mod wasm32;
+
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(feature = "internals")]
+pub mod x86;
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(not(feature = "internals"))]
 pub(crate) mod x86;
 
 #[cfg(test)]
@@ -278,6 +319,20 @@ pub fn has_vector_elementwise<F: FieldKernels>() -> bool {
 }
 
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(feature = "internals")]
+/// Matrix-like coefficient/source provider for the register-blocked x86 kernels.
+#[allow(clippy::len_without_is_empty)]
+pub trait Matrix<C> {
+    /// Number of terms.
+    fn len(&self) -> usize;
+    /// The coefficient of `term` for destination row `row`.
+    fn coefficient(&self, term: usize, row: usize) -> &C;
+    /// The source buffer of `term`.
+    fn source(&self, term: usize) -> &[u8];
+}
+
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(not(feature = "internals"))]
 pub(crate) trait Matrix<C> {
     fn len(&self) -> usize;
     fn coefficient(&self, term: usize, row: usize) -> &C;
@@ -303,6 +358,19 @@ impl<C> Matrix<C> for [(&[C], &[u8])] {
 }
 
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(feature = "internals")]
+/// Flat row-major coefficient matrix over borrowed sources.
+pub struct FlatMatrix<'a, C> {
+    /// Flat row-major coefficients, `terms * nrows` entries.
+    pub coefficients: &'a [C],
+    /// Destination row count.
+    pub nrows: usize,
+    /// Source buffers, one per term.
+    pub sources: &'a [&'a [u8]],
+}
+
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(not(feature = "internals"))]
 pub(crate) struct FlatMatrix<'a, C> {
     pub(crate) coefficients: &'a [C],
     pub(crate) nrows: usize,
@@ -336,6 +404,8 @@ impl<C> Matrix<C> for FlatMatrix<'_, C> {
 ///
 /// All slice lengths are in **bytes** and must be whole multiples of
 /// `Self::BYTES`. `dst` and `src` must have equal length.
+// The seal stays private even under `internals`: implementors are fixed.
+#[allow(private_interfaces)]
 pub trait FieldKernels: Field + private::Sealed {
     /// The backend-ready form of one coefficient.
     ///
@@ -529,7 +599,19 @@ pub trait FieldKernels: Field + private::Sealed {
 ///
 /// # Panics
 /// Panics if the slices differ in length.
+#[cfg(feature = "internals")]
+pub fn xor(dst: &mut [u8], src: &[u8]) {
+    assert_eq!(dst.len(), src.len(), "fff::xor: length mismatch");
+    xor_impl(dst, src);
+}
+
+#[cfg(not(feature = "internals"))]
 pub(crate) fn xor(dst: &mut [u8], src: &[u8]) {
+    assert_eq!(dst.len(), src.len(), "fff::xor: length mismatch");
+    xor_impl(dst, src);
+}
+
+fn xor_impl(dst: &mut [u8], src: &[u8]) {
     assert_eq!(dst.len(), src.len(), "fff::xor: length mismatch");
 
     match backend() {

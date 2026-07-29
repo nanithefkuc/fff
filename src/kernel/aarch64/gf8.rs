@@ -146,7 +146,7 @@ impl RowPlan {
 }
 
 /// `dst ^= coeff * src`, two 16-byte NEON lanes per iteration.
-pub(crate) fn mul_add_neon(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+pub fn mul_add_neon(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: NEON is baseline on AArch64; the slices are independently
     // borrowed and the kernel never runs past the shorter of the two.
@@ -190,7 +190,7 @@ unsafe fn mul_add_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
 ///
 /// Deliberately unblocked: scaling a row in place is a setup step, not a hot
 /// loop, and the simple shape is the one that is obviously right.
-pub(crate) fn mul_assign_neon(dst: &mut [u8], table: &ScaleTable) {
+pub fn mul_assign_neon(dst: &mut [u8], table: &ScaleTable) {
     // SAFETY: NEON is baseline on AArch64 and `dst` is uniquely borrowed.
     unsafe { mul_assign_impl(dst, table) }
 }
@@ -218,7 +218,7 @@ unsafe fn mul_assign_impl(dst: &mut [u8], table: &ScaleTable) {
 ///
 /// Fuses what would otherwise be a copy followed by an in-place scale: one
 /// pass, and `dst` is never read.
-pub(crate) fn mul_into_neon(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+pub fn mul_into_neon(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: NEON is baseline on AArch64; the slices are independently
     // borrowed and the kernel never runs past the shorter of the two.
@@ -259,7 +259,7 @@ unsafe fn mul_into_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
 ///
 /// `rows` is `coeffs.len()` contiguous rows of `row_len` bytes, and
 /// `row_len == src.len()`.
-pub(crate) fn scatter_neon(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
+pub fn scatter_neon(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
     debug_assert_eq!(row_len, src.len());
     debug_assert!(rows.len() >= coeffs.len().saturating_mul(row_len));
     if row_len == 0 || coeffs.is_empty() {
@@ -358,12 +358,7 @@ unsafe fn scatter_quad(plans: &[RowPlan; 4], src: &[u8], span: usize) {
 /// destination tile into eight accumulators once, folds in every term, and
 /// stores once. Destination memory traffic is therefore independent of
 /// `terms.len()`, which is what separates this from a `scatter_neon` per term.
-pub(crate) fn matrix_neon(
-    rows: &mut [u8],
-    row_len: usize,
-    nrows: usize,
-    terms: &[(&[Elem], &[u8])],
-) {
+pub fn matrix_neon(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
     debug_assert!(rows.len() >= nrows.saturating_mul(row_len));
     if row_len == 0 || nrows == 0 || terms.is_empty() {
         return;
@@ -589,7 +584,7 @@ unsafe fn matrix_single(ptr: *mut u8, span: usize, index: usize, terms: &[(&[Ele
 
 /// Fold many sources into one destination while keeping each 32-byte
 /// destination tile in registers across every source.
-pub(crate) fn gather_neon(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
+pub fn gather_neon(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
     // SAFETY: NEON is baseline on AArch64 and callers checked source lengths.
     unsafe { gather_impl(dst, coeffs, srcs) }
@@ -682,7 +677,7 @@ pub(super) fn multiply_vectors_pmull(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t
 }
 
 /// `dst[i] = a[i] * b[i]` using the optional AArch64 crypto extension.
-pub(crate) fn elementwise_pmull(dst: &mut [u8], a: &[u8], b: &[u8]) {
+pub fn elementwise_pmull(dst: &mut [u8], a: &[u8], b: &[u8]) {
     debug_assert_eq!(dst.len(), a.len());
     debug_assert_eq!(dst.len(), b.len());
     // SAFETY: dispatch checked the AArch64 `aes` feature, which includes
@@ -709,7 +704,7 @@ unsafe fn elementwise_pmull_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
 }
 
 /// `dst[i] = a[i] * b[i]` over byte field elements.
-pub(crate) fn elementwise_neon(dst: &mut [u8], a: &[u8], b: &[u8]) {
+pub fn elementwise_neon(dst: &mut [u8], a: &[u8], b: &[u8]) {
     debug_assert_eq!(dst.len(), a.len());
     debug_assert_eq!(dst.len(), b.len());
     // SAFETY: NEON is baseline on AArch64 and all three lengths match.

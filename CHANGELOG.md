@@ -11,6 +11,12 @@ All notable changes to this project are documented here. The format follows
 - crates.io publishing metadata and docs.rs configuration; the crate is
   distributed through git only.
 
+### Added
+
+- `internals` feature exposing the kernel modules and preparation types
+  (`ScaleTable`, `TowerCoeff`, `TowerTables`, backend-specific SIMD entry
+  points) for downstream libraries that build directly on the kernels.
+
 ## [0.1.1] - 2026-07-29
 
 ### Added
