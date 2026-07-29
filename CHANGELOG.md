@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Removed
+
+- crates.io publishing metadata and docs.rs configuration; the crate is
+  distributed through git only.
+
 ## [0.1.1] - 2026-07-29
 
 ### Added

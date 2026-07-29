@@ -13,16 +13,18 @@ it is deliberately not a codec.
 
 ## Install
 
+`fff` is distributed through git only; it is not published to crates.io.
+
 ```toml
 [dependencies]
-fff = "0.1"
+fff = { git = "https://github.com/nanithefkuc/fff" }
 ```
 
 The default enables `std` and SIMD dispatch. Portable `no_std` builds use:
 
 ```toml
 [dependencies]
-fff = { version = "0.1", default-features = false }
+fff = { git = "https://github.com/nanithefkuc/fff", default-features = false }
 ```
 
 MSRV is Rust 1.89.

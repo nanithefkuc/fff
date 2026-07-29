@@ -6,12 +6,9 @@ rust-version = "1.89"
 description = "Faster Finite Fields: SIMD and portable binary tower arithmetic and vector kernels"
 license = "MIT"
 repository = "https://github.com/nanithefkuc/fff"
-documentation = "https://docs.rs/fff"
 readme = "README.md"
 homepage = "https://github.com/nanithefkuc/fff"
-keywords = ["galois", "finite-field", "simd", "gf256", "erasure"]
-categories = ["algorithms", "mathematics", "no-std"]
-exclude = ["/external-bench", "/.github"]
+publish = false
 
 [features]
 default = ["std", "simd"]
@@ -26,10 +23,6 @@ simd = ["std"]
 
 [dev-dependencies]
 reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
-
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
 
 [profile.bench]
 lto = "thin"

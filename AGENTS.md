@@ -129,7 +129,8 @@ and host-specific compiler flags.
 ## Important Files
 
 - `Cargo.toml` — package metadata, Rust 2024/MSRV 1.89, `std`/`simd` feature
-  graph, docs.rs settings, bench profile and targets.
+  graph, bench profile and targets. Publishing is disabled (`publish =
+  false`); the crate is git-only.
 - `src/lib.rs` — crate scope, lint/safety policy, public modules and re-exports.
 - `src/field/mod.rs` — canonical scalar/marker contracts and byte invariant.
 - `src/ops.rs` — validated public operations, `Coeff`, `Plan`, packing helpers.
