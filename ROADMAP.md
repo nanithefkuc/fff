@@ -23,10 +23,6 @@ implementation.
 
 ## Performance
 
-- Add direct prepared, register-blocked scatter/gather/matrix entry points for
-  backends where they beat repeated prepared AXPY. `Plan` already avoids table
-  construction; this work would also recover the destination-memory advantage
-  of each backend's blocked raw-coefficient path.
 - Revisit the measured crossover rules per `(field, backend, shape)`. A backend
   name alone cannot predict whether a particular operation is register-blocked.
 - Investigate vector implementations for `Gf32`, `Gf64`, and the canonical

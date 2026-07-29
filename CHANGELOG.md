@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-29
+
 ### Added
 
 - Prepared `Plan` consumers for scatter, gather, and matrix operations.
@@ -27,10 +29,13 @@ All notable changes to this project are documented here. The format follows
 - Internal scalar kernels, SIMD table layouts, and raw XOR dispatch are no
   longer public semver surface.
 - x86 GF(2^8) kernels retain SIMD processing through 16-byte tails.
+- Prepared GF(2^8) and GF(2^16) plans retain register-blocked x86 kernels
+  where they outperform repeated prepared AXPY.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-07-29
 
 Initial public release.
 
-[Unreleased]: https://github.com/nanithefkuc/fff/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/nanithefkuc/fff/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/nanithefkuc/fff/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nanithefkuc/fff/releases/tag/v0.1.0
