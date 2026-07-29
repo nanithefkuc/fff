@@ -53,6 +53,50 @@ fn bench(label: &str, bytes: usize, mut body: impl FnMut()) {
     println!("  {label:<44} {:>9.2?}  {gib_per_sec:>7.2} GiB/s", median);
 }
 
+/// Payload lengths used by network-facing consumers.
+///
+/// The run around 1,200 bytes alternates exact 32-byte lanes with 16-byte
+/// remainders so SIMD tail cliffs stay visible.
+const NETWORK_LENGTHS: &[usize] = &[
+    64, 256, 512, 1_152, 1_168, 1_184, 1_200, 1_216, 1_232, 1_248, 1_400,
+];
+
+fn bench_network_payloads() {
+    println!("network-size GF(2^8) payloads:");
+    for &len in NETWORK_LENGTHS {
+        println!("  payload {len} B:");
+        let src = noise(len, 0x700 + len as u64);
+        let mut dst = noise(len, 0x800 + len as u64);
+
+        bench("xor", len, || {
+            ops::add_assign::<Gf8>(black_box(&mut dst), black_box(&src));
+        });
+        bench("mul_add", len, || {
+            ops::mul_add::<Gf8>(black_box(&mut dst), gf8::Elem(0x53), black_box(&src));
+        });
+        bench("mul_assign", len, || {
+            ops::mul_assign::<Gf8>(black_box(&mut dst), gf8::Elem(0x53));
+        });
+
+        for nrows in [4usize, 16] {
+            let coeffs: Vec<_> = (0..nrows)
+                .map(|row| gf8::Elem((row as u8).wrapping_mul(37).wrapping_add(2)))
+                .collect();
+            let mut rows = noise(len * nrows, 0x900 + nrows as u64);
+            let label = format!("scatter ({nrows} rows)");
+            bench(&label, len * nrows, || {
+                ops::mul_add_scatter::<Gf8>(
+                    black_box(&mut rows),
+                    len,
+                    black_box(&coeffs),
+                    black_box(&src),
+                );
+            });
+        }
+    }
+    println!();
+}
+
 fn main() {
     println!("fff kernel benchmark — backend: {}", backend().name());
     println!("  (override with FFF_BACKEND=avx512|gfni|avx2|ssse3|neon|scalar)\n");
@@ -79,6 +123,8 @@ fn main() {
         );
     });
     println!();
+
+    bench_network_payloads();
 
     // L1-resident, L2-resident, and DRAM-resident.
     for &len in &[4 * 1024usize, 256 * 1024, 8 * 1024 * 1024] {
@@ -136,6 +182,8 @@ fn main() {
         let coeffs16: Vec<_> = (0..nrows)
             .map(|j| gf16::Elem((j as u16).wrapping_mul(9871).wrapping_add(2)))
             .collect();
+        let scatter_plan8 = ops::Plan::<Gf8>::new(&coeffs8);
+        let scatter_plan16 = ops::Plan::<Gf16>::new(&coeffs16);
 
         let traffic = row_len * nrows;
         bench("scatter                   gf8", traffic, || {
@@ -143,6 +191,22 @@ fn main() {
         });
         bench("scatter                  gf16", traffic, || {
             ops::mul_add_scatter::<Gf16>(black_box(&mut rows), row_len, &coeffs16, black_box(&src));
+        });
+        bench("scatter prepared          gf8", traffic, || {
+            ops::mul_add_scatter_with::<Gf8>(
+                black_box(&mut rows),
+                row_len,
+                &scatter_plan8,
+                black_box(&src),
+            );
+        });
+        bench("scatter prepared         gf16", traffic, || {
+            ops::mul_add_scatter_with::<Gf16>(
+                black_box(&mut rows),
+                row_len,
+                &scatter_plan16,
+                black_box(&src),
+            );
         });
         bench("scatter (unblocked)       gf8", traffic, || {
             for (row, &coeff) in rows.chunks_exact_mut(row_len).zip(&coeffs8) {
@@ -183,6 +247,11 @@ fn main() {
             .zip(&sources)
             .map(|(c, s)| (c.as_slice(), s.as_slice()))
             .collect();
+        let matrix_coeffs8: Vec<_> = coeff_sets.iter().flatten().copied().collect();
+        let matrix_coeffs16: Vec<_> = coeff_sets16.iter().flatten().copied().collect();
+        let matrix_plan8 = ops::Plan::<Gf8>::matrix(8, nrows, &matrix_coeffs8);
+        let matrix_plan16 = ops::Plan::<Gf16>::matrix(8, nrows, &matrix_coeffs16);
+        let matrix_srcs: Vec<&[u8]> = sources.iter().take(8).map(Vec::as_slice).collect();
 
         let traffic = row_len * nrows * 8;
         bench("matrix (selected)          gf8", traffic, || {
@@ -198,6 +267,24 @@ fn main() {
         bench("matrix (selected)         gf16", traffic, || {
             ops::mul_add_matrix::<Gf16>(black_box(&mut rows), row_len, nrows, &terms16);
         });
+        bench("matrix prepared           gf8", traffic, || {
+            ops::mul_add_matrix_with::<Gf8>(
+                black_box(&mut rows),
+                row_len,
+                nrows,
+                &matrix_plan8,
+                black_box(&matrix_srcs),
+            );
+        });
+        bench("matrix prepared          gf16", traffic, || {
+            ops::mul_add_matrix_with::<Gf16>(
+                black_box(&mut rows),
+                row_len,
+                nrows,
+                &matrix_plan16,
+                black_box(&matrix_srcs),
+            );
+        });
         bench("matrix (unblocked AXPY)  gf16", traffic, || {
             for &(coeffs, src) in &terms16 {
                 for (row, &coeff) in rows.chunks_exact_mut(row_len).zip(coeffs) {
@@ -208,6 +295,8 @@ fn main() {
 
         let gather_srcs: Vec<&[u8]> = sources.iter().take(nrows).map(Vec::as_slice).collect();
         let mut gathered = noise(row_len, 5);
+        let gather_plan8 = ops::Plan::<Gf8>::new(&coeffs8);
+        let gather_plan16 = ops::Plan::<Gf16>::new(&coeffs16);
         let gather_traffic = row_len * nrows;
         bench("gather (selected)          gf8", gather_traffic, || {
             ops::mul_add_gather::<Gf8>(black_box(&mut gathered), &coeffs8, black_box(&gather_srcs));
@@ -221,6 +310,20 @@ fn main() {
             ops::mul_add_gather::<Gf16>(
                 black_box(&mut gathered),
                 &coeffs16,
+                black_box(&gather_srcs),
+            );
+        });
+        bench("gather prepared           gf8", gather_traffic, || {
+            ops::mul_add_gather_with::<Gf8>(
+                black_box(&mut gathered),
+                &gather_plan8,
+                black_box(&gather_srcs),
+            );
+        });
+        bench("gather prepared          gf16", gather_traffic, || {
+            ops::mul_add_gather_with::<Gf16>(
+                black_box(&mut gathered),
+                &gather_plan16,
                 black_box(&gather_srcs),
             );
         });

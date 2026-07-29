@@ -54,7 +54,18 @@ unsafe fn xor_avx2_impl(dst: &mut [u8], src: &[u8]) {
         }
         offset += 32;
     }
-    scalar::xor(&mut dst[len..], &src[len..]);
+    let mut offset = len;
+    if offset + 16 <= dst.len() {
+        // SAFETY: `offset + 16 <= dst.len() == src.len()`, and AVX2 implies
+        // SSE2 for the single narrow tail lane.
+        unsafe {
+            let d = _mm_loadu_si128(dst_ptr.add(offset).cast());
+            let s = _mm_loadu_si128(src_ptr.add(offset).cast());
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), _mm_xor_si128(d, s));
+        }
+        offset += 16;
+    }
+    scalar::xor(&mut dst[offset..], &src[offset..]);
 }
 
 /// `dst ^= src` using 16-byte SSE2 lanes.

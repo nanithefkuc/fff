@@ -154,6 +154,15 @@ impl FieldKernels for Gf8 {
             _ => scalar::mul_add_scatter::<Self>(rows, row_len, coeffs, src),
         }
     }
+    fn mul_add_scatter_plan(
+        rows: &mut [u8],
+        row_len: usize,
+        values: &[Elem],
+        _coeffs: &[Self::Prepared],
+        src: &[u8],
+    ) {
+        Self::mul_add_scatter(rows, row_len, values, src);
+    }
 
     fn mul_add_gather(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
         match backend() {
@@ -176,6 +185,14 @@ impl FieldKernels for Gf8 {
             _ => scalar::mul_add_gather::<Self>(dst, coeffs, srcs),
         }
     }
+    fn mul_add_gather_plan(
+        dst: &mut [u8],
+        values: &[Elem],
+        _coeffs: &[Self::Prepared],
+        srcs: &[&[u8]],
+    ) {
+        Self::mul_add_gather(dst, values, srcs);
+    }
 
     fn mul_add_matrix(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
         match backend() {
@@ -192,6 +209,47 @@ impl FieldKernels for Gf8 {
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => scalar::mul_add_matrix::<Self>(rows, row_len, nrows, terms),
             _ => scalar::mul_add_matrix::<Self>(rows, row_len, nrows, terms),
+        }
+    }
+    fn mul_add_matrix_plan(
+        rows: &mut [u8],
+        row_len: usize,
+        nrows: usize,
+        values: &[Elem],
+        coeffs: &[Self::Prepared],
+        srcs: &[&[u8]],
+    ) {
+        #[cfg(not(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64"))))]
+        let _ = values;
+        #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            let terms = crate::kernel::FlatMatrix {
+                coefficients: values,
+                nrows,
+                sources: srcs,
+            };
+            match backend() {
+                Backend::Gfni => {
+                    return x86::gf8::matrix_gfni_with(rows, row_len, nrows, &terms);
+                }
+                Backend::Avx2 => {
+                    return x86::gf8::matrix_avx2_with(rows, row_len, nrows, &terms);
+                }
+                Backend::Ssse3 => {
+                    return x86::gf8::matrix_ssse3_with(rows, row_len, nrows, &terms);
+                }
+                _ => {}
+            }
+        }
+        for (term, &src) in srcs.iter().enumerate() {
+            let start = term * nrows;
+            for (row, coeff) in rows
+                .chunks_exact_mut(row_len)
+                .take(nrows)
+                .zip(&coeffs[start..start + nrows])
+            {
+                Self::mul_add(row, coeff, src);
+            }
         }
     }
 

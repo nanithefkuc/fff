@@ -14,11 +14,9 @@
 //!   against a [`ScaleTable`]. `PSHUFB` indexes within each 128-bit half, so
 //!   the AVX2 form broadcasts the 16-byte table into both halves first.
 //!
-//! Buffer lengths are arbitrary, so every loop hands its sub-lane remainder
-//! to the scalar nibble kernels in [`crate::kernel::gf8`]. The GFNI entry
-//! points carry a coefficient rather than a table and borrow one from the
-//! shared bank ([`scale_table`]) for that tail — an index into a `static`,
-//! not a table build.
+//! Buffer lengths are arbitrary, so x86 kernels descend through 32-byte and
+//! 16-byte SIMD lanes before handing only the sub-XMM remainder to the scalar
+//! nibble kernels in [`crate::kernel::gf8`].
 
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
@@ -26,6 +24,7 @@ use core::arch::x86::*;
 use core::arch::x86_64::*;
 
 use crate::field::gf8::Elem;
+use crate::kernel::Matrix;
 use crate::kernel::gf8::{mul_add_nibble, mul_assign_nibble, mul_into_nibble};
 use crate::kernel::tables::{ScaleTable, scale_table};
 
@@ -47,6 +46,7 @@ pub(crate) fn mul_add_gfni(dst: &mut [u8], coeff: Elem, src: &[u8]) {
 #[target_feature(enable = "avx2,gfni")]
 unsafe fn mul_add_gfni_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     let factor = _mm256_set1_epi8(coeff.0.cast_signed());
+    let factor128 = _mm256_castsi256_si128(factor);
     let len = dst.len();
     let (dst_ptr, src_ptr) = (dst.as_mut_ptr(), src.as_ptr());
     let mut offset = 0;
@@ -88,6 +88,16 @@ unsafe fn mul_add_gfni_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
         }
         offset += 32;
     }
+    if offset + 16 <= len {
+        // SAFETY: `offset + 16 <= len == dst.len() == src.len()`.
+        unsafe {
+            let x = _mm_loadu_si128(src_ptr.add(offset).cast());
+            let d = _mm_loadu_si128(dst_ptr.add(offset).cast());
+            let r = _mm_xor_si128(d, _mm_gf2p8mul_epi8(x, factor128));
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), r);
+        }
+        offset += 16;
+    }
 
     mul_add_nibble(&mut dst[offset..], scale_table(coeff), &src[offset..]);
 }
@@ -102,6 +112,7 @@ pub(crate) fn mul_assign_gfni(dst: &mut [u8], coeff: Elem) {
 #[target_feature(enable = "avx2,gfni")]
 unsafe fn mul_assign_gfni_impl(dst: &mut [u8], coeff: Elem) {
     let factor = _mm256_set1_epi8(coeff.0.cast_signed());
+    let factor128 = _mm256_castsi256_si128(factor);
     let len = dst.len() & !31;
     let dst_ptr = dst.as_mut_ptr();
     let mut offset = 0;
@@ -115,8 +126,17 @@ unsafe fn mul_assign_gfni_impl(dst: &mut [u8], coeff: Elem) {
         }
         offset += 32;
     }
+    let mut offset = len;
+    if offset + 16 <= dst.len() {
+        // SAFETY: `offset + 16 <= dst.len()`.
+        unsafe {
+            let d = _mm_loadu_si128(dst_ptr.add(offset).cast());
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), _mm_gf2p8mul_epi8(d, factor128));
+        }
+        offset += 16;
+    }
 
-    mul_assign_nibble(&mut dst[len..], scale_table(coeff));
+    mul_assign_nibble(&mut dst[offset..], scale_table(coeff));
 }
 
 /// `dst = coeff * src` using `GF2P8MULB` over 32-byte lanes.
@@ -137,6 +157,7 @@ pub(crate) fn mul_into_gfni(dst: &mut [u8], coeff: Elem, src: &[u8]) {
 #[target_feature(enable = "avx2,gfni")]
 unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     let factor = _mm256_set1_epi8(coeff.0.cast_signed());
+    let factor128 = _mm256_castsi256_si128(factor);
     let len = dst.len();
     let (dst_ptr, src_ptr) = (dst.as_mut_ptr(), src.as_ptr());
     let mut offset = 0;
@@ -167,6 +188,14 @@ unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
             _mm256_storeu_si256(dst_ptr.add(offset).cast(), _mm256_gf2p8mul_epi8(x, factor));
         }
         offset += 32;
+    }
+    if offset + 16 <= len {
+        // SAFETY: `offset + 16 <= len == dst.len() == src.len()`.
+        unsafe {
+            let x = _mm_loadu_si128(src_ptr.add(offset).cast());
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), _mm_gf2p8mul_epi8(x, factor128));
+        }
+        offset += 16;
     }
 
     mul_into_nibble(&mut dst[offset..], scale_table(coeff), &src[offset..]);
@@ -229,6 +258,7 @@ pub(crate) fn mul_add_ssse3(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     unsafe { mul_add_ssse3_impl(dst, table, src) }
 }
 
+#[inline]
 #[target_feature(enable = "ssse3")]
 unsafe fn mul_add_ssse3_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     // SAFETY: `lo` and `hi` are 16-byte arrays, exactly one `__m128i` each.
@@ -298,7 +328,8 @@ unsafe fn mul_into_avx2_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
         offset += 32;
     }
 
-    mul_into_nibble(&mut dst[len..], table, &src[len..]);
+    // SAFETY: AVX2 implies SSSE3, and the remainders keep equal lengths.
+    unsafe { mul_into_ssse3_impl(&mut dst[len..], table, &src[len..]) }
 }
 
 /// `dst = coeff * dst` by nibble shuffle over 32-byte lanes.
@@ -342,6 +373,7 @@ pub(crate) fn mul_assign_ssse3(dst: &mut [u8], table: &ScaleTable) {
     unsafe { mul_assign_ssse3_impl(dst, table) }
 }
 
+#[inline]
 #[target_feature(enable = "ssse3")]
 unsafe fn mul_assign_ssse3_impl(dst: &mut [u8], table: &ScaleTable) {
     // SAFETY: `lo` and `hi` are 16-byte arrays, exactly one `__m128i` each.
@@ -384,6 +416,7 @@ pub(crate) fn mul_into_ssse3(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     unsafe { mul_into_ssse3_impl(dst, table, src) }
 }
 
+#[inline]
 #[target_feature(enable = "ssse3")]
 unsafe fn mul_into_ssse3_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     // SAFETY: `lo` and `hi` are 16-byte arrays, exactly one `__m128i` each.
@@ -499,12 +532,10 @@ unsafe fn scatter_gfni_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], sr
 /// destination is ours to choose.
 #[inline]
 fn peel_to_align(ptr: *const u8, len: usize) -> usize {
-    // The peel runs on the scalar kernel, so it only pays once the vector
-    // body is long enough to hide it. Measured on this machine with a
-    // 16-byte-aligned destination and eight rows, peeling wins from about
-    // 2 KiB up (2 KiB: 67 -> 74 GiB/s, 3 KiB: 64 -> 90, 4 KiB: 64 -> 99) and
-    // loses badly below 1 KiB, where 31 scalar bytes swamp the row (128 B:
-    // 23 -> 9). Sixteen turns of the 128-byte body is the crossover.
+    // The peel uses 128-bit GFNI where possible and scalar code below one XMM
+    // lane. Keep the conservative crossover measured for the former all-scalar
+    // peel: it won from about 2 KiB up and lost badly below 1 KiB. Sixteen
+    // turns of the 128-byte body remains the floor.
     const FLOOR: usize = 16 * 128;
     let head = ptr.align_offset(32);
     // `align_offset` reports `usize::MAX` only for an unreachable alignment,
@@ -654,13 +685,16 @@ unsafe fn scatter_rows2(ptrs: [*mut u8; 2], coeffs: [Elem; 2], src: &[u8]) {
     unsafe { scatter_span(ptrs.iter().zip(&coeffs), offset, len, src) }
 }
 
-/// Scalar span shared by the scatter row groups: apply `src[start..end]` to
-/// the matching bytes of every staged row.
+/// Narrow SIMD span shared by the GFNI scatter row groups.
+///
+/// Processes complete 16-byte lanes with GFNI and leaves fewer than 16 bytes
+/// to the scalar nibble kernel.
 ///
 /// # Safety
 /// Every pointer must address a distinct, in-bounds row of at least
-/// `src.len()` bytes, `start..end` must lie within `0..=src.len()`, and no
-/// slice into those rows may be live.
+/// `src.len()` bytes, `start..end` must lie within `0..=src.len()`, no slice
+/// into those rows may be live, and the caller must have selected GFNI.
+#[target_feature(enable = "sse2,gfni")]
 unsafe fn scatter_span<'a>(
     rows: impl Iterator<Item = (&'a *mut u8, &'a Elem)>,
     start: usize,
@@ -670,12 +704,28 @@ unsafe fn scatter_span<'a>(
     if start >= end {
         return;
     }
+    let vector_end = start + ((end - start) & !15);
     for (&row, &coeff) in rows {
-        // SAFETY: `start..end` lies inside `0..src.len()`, the common row
-        // length, so this is a sub-range of the row itself; the rows are
-        // disjoint and only one slice is live at a time.
-        let dst = unsafe { core::slice::from_raw_parts_mut(row.add(start), end - start) };
-        mul_add_nibble(dst, scale_table(coeff), &src[start..end]);
+        let factor = _mm_set1_epi8(coeff.0.cast_signed());
+        let mut offset = start;
+        while offset < vector_end {
+            // SAFETY: `offset + 16 <= vector_end <= end <= src.len()` bounds
+            // both source and row accesses.
+            unsafe {
+                let x = _mm_loadu_si128(src.as_ptr().add(offset).cast());
+                let ptr = row.add(offset);
+                let d = _mm_loadu_si128(ptr.cast());
+                _mm_storeu_si128(ptr.cast(), _mm_xor_si128(d, _mm_gf2p8mul_epi8(x, factor)));
+            }
+            offset += 16;
+        }
+        if vector_end < end {
+            // SAFETY: `vector_end..end` is the row's final sub-lane span; rows
+            // are disjoint and only one mutable slice is live at a time.
+            let dst =
+                unsafe { core::slice::from_raw_parts_mut(row.add(vector_end), end - vector_end) };
+            mul_add_nibble(dst, scale_table(coeff), &src[vector_end..end]);
+        }
     }
 }
 
@@ -710,21 +760,25 @@ pub(crate) fn matrix_gfni(
     nrows: usize,
     terms: &[(&[Elem], &[u8])],
 ) {
+    matrix_gfni_with(rows, row_len, nrows, terms);
+}
+
+pub(crate) fn matrix_gfni_with<M: Matrix<Elem> + ?Sized>(
+    rows: &mut [u8],
+    row_len: usize,
+    nrows: usize,
+    terms: &M,
+) {
     assert!(
         nrows
             .checked_mul(row_len)
             .is_some_and(|needed| needed <= rows.len()),
         "matrix_gfni: rows buffer does not hold {nrows} rows of {row_len} bytes"
     );
-    for &(coeffs, src) in terms {
-        assert!(
-            coeffs.len() >= nrows,
-            "matrix_gfni: term supplies {} coefficients for {nrows} rows",
-            coeffs.len()
-        );
-        assert_eq!(src.len(), row_len);
+    for term in 0..terms.len() {
+        assert_eq!(terms.source(term).len(), row_len);
     }
-    if terms.is_empty() {
+    if terms.len() == 0 {
         return;
     }
     // SAFETY: the caller selected the GFNI backend, which detected both AVX2
@@ -733,11 +787,11 @@ pub(crate) fn matrix_gfni(
 }
 
 #[target_feature(enable = "avx2,gfni")]
-unsafe fn matrix_gfni_impl(
+unsafe fn matrix_gfni_impl<M: Matrix<Elem> + ?Sized>(
     rows: &mut [u8],
     row_len: usize,
     nrows: usize,
-    terms: &[(&[Elem], &[u8])],
+    terms: &M,
 ) {
     let base = rows.as_mut_ptr();
     // Rows are grouped four at a time, then a pair, then whatever single row
@@ -785,7 +839,12 @@ unsafe fn matrix_gfni_impl(
 /// bytes, every term's source must be `row_len` bytes, and every term must
 /// supply coefficients through index `g + 3`.
 #[target_feature(enable = "avx2,gfni")]
-unsafe fn matrix_rows4(ptrs: [*mut u8; 4], row_len: usize, g: usize, terms: &[(&[Elem], &[u8])]) {
+unsafe fn matrix_rows4<M: Matrix<Elem> + ?Sized>(
+    ptrs: [*mut u8; 4],
+    row_len: usize,
+    g: usize,
+    terms: &M,
+) {
     let mut tile = 0;
     while tile + 64 <= row_len {
         // SAFETY: `tile + 64 <= row_len`, the length of every row; the rows
@@ -802,18 +861,24 @@ unsafe fn matrix_rows4(ptrs: [*mut u8; 4], row_len: usize, g: usize, terms: &[(&
                 _mm256_loadu_si256(ptrs[3].add(tile + 32).cast()),
             )
         };
-        for &(coeffs, src) in terms {
-            // SAFETY: the caller guarantees `coeffs.len() > g + 3`, and
-            // `src.len() == row_len`, so `tile + 64` bounds both loads.
+        for term in 0..terms.len() {
+            let src = terms.source(term);
+            let coeffs = [
+                *terms.coefficient(term, g),
+                *terms.coefficient(term, g + 1),
+                *terms.coefficient(term, g + 2),
+                *terms.coefficient(term, g + 3),
+            ];
+            // SAFETY: every source is `row_len` bytes, so `tile + 64` bounds
+            // both loads.
             unsafe {
-                let cp = coeffs.as_ptr().add(g);
                 let sp = src.as_ptr().add(tile);
                 let x0 = _mm256_loadu_si256(sp.cast());
                 let x1 = _mm256_loadu_si256(sp.add(32).cast());
-                let f0 = _mm256_set1_epi8((*cp).0.cast_signed());
-                let f1 = _mm256_set1_epi8((*cp.add(1)).0.cast_signed());
-                let f2 = _mm256_set1_epi8((*cp.add(2)).0.cast_signed());
-                let f3 = _mm256_set1_epi8((*cp.add(3)).0.cast_signed());
+                let f0 = _mm256_set1_epi8(coeffs[0].0.cast_signed());
+                let f1 = _mm256_set1_epi8(coeffs[1].0.cast_signed());
+                let f2 = _mm256_set1_epi8(coeffs[2].0.cast_signed());
+                let f3 = _mm256_set1_epi8(coeffs[3].0.cast_signed());
                 a00 = _mm256_xor_si256(a00, _mm256_gf2p8mul_epi8(x0, f0));
                 a01 = _mm256_xor_si256(a01, _mm256_gf2p8mul_epi8(x1, f0));
                 a10 = _mm256_xor_si256(a10, _mm256_gf2p8mul_epi8(x0, f1));
@@ -848,16 +913,21 @@ unsafe fn matrix_rows4(ptrs: [*mut u8; 4], row_len: usize, g: usize, terms: &[(&
                 _mm256_loadu_si256(ptrs[3].add(tile).cast()),
             )
         };
-        for &(coeffs, src) in terms {
-            // SAFETY: the caller guarantees `coeffs.len() > g + 3`, and
-            // `src.len() == row_len` bounds the load.
+        for term in 0..terms.len() {
+            let src = terms.source(term);
+            let coeffs = [
+                *terms.coefficient(term, g),
+                *terms.coefficient(term, g + 1),
+                *terms.coefficient(term, g + 2),
+                *terms.coefficient(term, g + 3),
+            ];
+            // SAFETY: every source is `row_len` bytes and bounds this load.
             unsafe {
-                let cp = coeffs.as_ptr();
                 let x = _mm256_loadu_si256(src.as_ptr().add(tile).cast());
-                let f0 = _mm256_set1_epi8((*cp.add(g)).0.cast_signed());
-                let f1 = _mm256_set1_epi8((*cp.add(g + 1)).0.cast_signed());
-                let f2 = _mm256_set1_epi8((*cp.add(g + 2)).0.cast_signed());
-                let f3 = _mm256_set1_epi8((*cp.add(g + 3)).0.cast_signed());
+                let f0 = _mm256_set1_epi8(coeffs[0].0.cast_signed());
+                let f1 = _mm256_set1_epi8(coeffs[1].0.cast_signed());
+                let f2 = _mm256_set1_epi8(coeffs[2].0.cast_signed());
+                let f3 = _mm256_set1_epi8(coeffs[3].0.cast_signed());
                 a0 = _mm256_xor_si256(a0, _mm256_gf2p8mul_epi8(x, f0));
                 a1 = _mm256_xor_si256(a1, _mm256_gf2p8mul_epi8(x, f1));
                 a2 = _mm256_xor_si256(a2, _mm256_gf2p8mul_epi8(x, f2));
@@ -882,7 +952,12 @@ unsafe fn matrix_rows4(ptrs: [*mut u8; 4], row_len: usize, g: usize, terms: &[(&
 /// # Safety
 /// As [`matrix_rows4`], for two rows and coefficients through `g + 1`.
 #[target_feature(enable = "avx2,gfni")]
-unsafe fn matrix_rows2(ptrs: [*mut u8; 2], row_len: usize, g: usize, terms: &[(&[Elem], &[u8])]) {
+unsafe fn matrix_rows2<M: Matrix<Elem> + ?Sized>(
+    ptrs: [*mut u8; 2],
+    row_len: usize,
+    g: usize,
+    terms: &M,
+) {
     let mut tile = 0;
     while tile + 128 <= row_len {
         // SAFETY: `tile + 128 <= row_len`, the length of both rows; the rows
@@ -899,18 +974,19 @@ unsafe fn matrix_rows2(ptrs: [*mut u8; 2], row_len: usize, g: usize, terms: &[(&
                 _mm256_loadu_si256(ptrs[1].add(tile + 96).cast()),
             )
         };
-        for &(coeffs, src) in terms {
-            // SAFETY: the caller guarantees `coeffs.len() > g + 1`, and
-            // `src.len() == row_len`, so `tile + 128` bounds the loads.
+        for term in 0..terms.len() {
+            let src = terms.source(term);
+            let coeffs = [*terms.coefficient(term, g), *terms.coefficient(term, g + 1)];
+            // SAFETY: every source is `row_len` bytes, so `tile + 128` bounds
+            // the loads.
             unsafe {
-                let cp = coeffs.as_ptr().add(g);
                 let sp = src.as_ptr().add(tile);
                 let x0 = _mm256_loadu_si256(sp.cast());
                 let x1 = _mm256_loadu_si256(sp.add(32).cast());
                 let x2 = _mm256_loadu_si256(sp.add(64).cast());
                 let x3 = _mm256_loadu_si256(sp.add(96).cast());
-                let f0 = _mm256_set1_epi8((*cp).0.cast_signed());
-                let f1 = _mm256_set1_epi8((*cp.add(1)).0.cast_signed());
+                let f0 = _mm256_set1_epi8(coeffs[0].0.cast_signed());
+                let f1 = _mm256_set1_epi8(coeffs[1].0.cast_signed());
                 a00 = _mm256_xor_si256(a00, _mm256_gf2p8mul_epi8(x0, f0));
                 a01 = _mm256_xor_si256(a01, _mm256_gf2p8mul_epi8(x1, f0));
                 a02 = _mm256_xor_si256(a02, _mm256_gf2p8mul_epi8(x2, f0));
@@ -942,14 +1018,15 @@ unsafe fn matrix_rows2(ptrs: [*mut u8; 2], row_len: usize, g: usize, terms: &[(&
                 _mm256_loadu_si256(ptrs[1].add(tile).cast()),
             )
         };
-        for &(coeffs, src) in terms {
-            // SAFETY: the caller guarantees `coeffs.len() > g + 1`, and
-            // `src.len() == row_len` bounds the load.
+        for term in 0..terms.len() {
+            let src = terms.source(term);
+            let coeff0 = *terms.coefficient(term, g);
+            let coeff1 = *terms.coefficient(term, g + 1);
+            // SAFETY: every source is `row_len` bytes and bounds the load.
             unsafe {
-                let cp = coeffs.as_ptr();
                 let x = _mm256_loadu_si256(src.as_ptr().add(tile).cast());
-                let f0 = _mm256_set1_epi8((*cp.add(g)).0.cast_signed());
-                let f1 = _mm256_set1_epi8((*cp.add(g + 1)).0.cast_signed());
+                let f0 = _mm256_set1_epi8(coeff0.0.cast_signed());
+                let f1 = _mm256_set1_epi8(coeff1.0.cast_signed());
                 a0 = _mm256_xor_si256(a0, _mm256_gf2p8mul_epi8(x, f0));
                 a1 = _mm256_xor_si256(a1, _mm256_gf2p8mul_epi8(x, f1));
             }
@@ -970,7 +1047,12 @@ unsafe fn matrix_rows2(ptrs: [*mut u8; 2], row_len: usize, g: usize, terms: &[(&
 /// # Safety
 /// As [`matrix_rows4`], for one row and coefficient `g`.
 #[target_feature(enable = "avx2,gfni")]
-unsafe fn matrix_rows1(ptr: *mut u8, row_len: usize, g: usize, terms: &[(&[Elem], &[u8])]) {
+unsafe fn matrix_rows1<M: Matrix<Elem> + ?Sized>(
+    ptr: *mut u8,
+    row_len: usize,
+    g: usize,
+    terms: &M,
+) {
     let mut tile = 0;
     while tile + 128 <= row_len {
         // SAFETY: `tile + 128 <= row_len`, the length of the row.
@@ -982,12 +1064,14 @@ unsafe fn matrix_rows1(ptr: *mut u8, row_len: usize, g: usize, terms: &[(&[Elem]
                 _mm256_loadu_si256(ptr.add(tile + 96).cast()),
             )
         };
-        for &(coeffs, src) in terms {
-            // SAFETY: the caller guarantees `coeffs.len() > g`, and
-            // `src.len() == row_len`, so `tile + 128` bounds the loads.
+        for term in 0..terms.len() {
+            let src = terms.source(term);
+            let coeff = *terms.coefficient(term, g);
+            // SAFETY: every source is `row_len` bytes, so `tile + 128` bounds
+            // the loads.
             unsafe {
                 let sp = src.as_ptr().add(tile);
-                let f = _mm256_set1_epi8((*coeffs.as_ptr().add(g)).0.cast_signed());
+                let f = _mm256_set1_epi8(coeff.0.cast_signed());
                 let x0 = _mm256_loadu_si256(sp.cast());
                 let x1 = _mm256_loadu_si256(sp.add(32).cast());
                 let x2 = _mm256_loadu_si256(sp.add(64).cast());
@@ -1010,11 +1094,12 @@ unsafe fn matrix_rows1(ptr: *mut u8, row_len: usize, g: usize, terms: &[(&[Elem]
     while tile + 32 <= row_len {
         // SAFETY: `tile + 32 <= row_len`.
         let mut a0 = unsafe { _mm256_loadu_si256(ptr.add(tile).cast()) };
-        for &(coeffs, src) in terms {
-            // SAFETY: the caller guarantees `coeffs.len() > g`, and
-            // `src.len() == row_len` bounds the load.
+        for term in 0..terms.len() {
+            let src = terms.source(term);
+            let coeff = *terms.coefficient(term, g);
+            // SAFETY: every source is `row_len` bytes and bounds the load.
             unsafe {
-                let f = _mm256_set1_epi8((*coeffs.as_ptr().add(g)).0.cast_signed());
+                let f = _mm256_set1_epi8(coeff.0.cast_signed());
                 let x = _mm256_loadu_si256(src.as_ptr().add(tile).cast());
                 a0 = _mm256_xor_si256(a0, _mm256_gf2p8mul_epi8(x, f));
             }
@@ -1028,20 +1113,23 @@ unsafe fn matrix_rows1(ptr: *mut u8, row_len: usize, g: usize, terms: &[(&[Elem]
     unsafe { matrix_tail(&[ptr], row_len, g, tile, terms) }
 }
 
-/// Scalar remainder shared by the matrix row groups: fold every term into the
-/// last `row_len - tile` bytes of each row.
+/// Hierarchical remainder shared by the GFNI matrix row groups.
+///
+/// Complete 32- and 16-byte lanes stay on GFNI through
+/// [`mul_add_gfni_impl`]; only the final sub-XMM bytes use scalar arithmetic.
 ///
 /// # Safety
 /// Every pointer must address a distinct, in-bounds row of `row_len` bytes,
-/// no slice into those rows may be live, and every term must supply
-/// coefficients through `g + ptrs.len() - 1` over a source of `row_len`
-/// bytes.
-unsafe fn matrix_tail(
+/// no slice into those rows may be live, every term must supply coefficients
+/// through `g + ptrs.len() - 1` over a source of `row_len` bytes, and the
+/// caller must have selected AVX2 + GFNI.
+#[target_feature(enable = "avx2,gfni")]
+unsafe fn matrix_tail<M: Matrix<Elem> + ?Sized>(
     ptrs: &[*mut u8],
     row_len: usize,
     g: usize,
     tile: usize,
-    terms: &[(&[Elem], &[u8])],
+    terms: &M,
 ) {
     if tile == row_len {
         return;
@@ -1052,10 +1140,13 @@ unsafe fn matrix_tail(
         // tail; the rows are disjoint and only one tail slice is live at a
         // time.
         let tail = unsafe { core::slice::from_raw_parts_mut(row.add(tile), remaining) };
-        for &(coeffs, src) in terms {
-            let coeff = coeffs[g + slot];
+        for term in 0..terms.len() {
+            let src = terms.source(term);
+            let coeff = *terms.coefficient(term, g + slot);
             if coeff.0 != 0 {
-                mul_add_nibble(tail, scale_table(coeff), &src[tile..]);
+                // SAFETY: the tail and source remainder have equal lengths,
+                // and this function's target features match the callee.
+                unsafe { mul_add_gfni_impl(tail, coeff, &src[tile..]) }
             }
         }
     }
@@ -1075,7 +1166,8 @@ pub(crate) fn elementwise_gfni(dst: &mut [u8], a: &[u8], b: &[u8]) {
 
 #[target_feature(enable = "avx2,gfni")]
 unsafe fn elementwise_gfni_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
-    let len = dst.len().min(a.len()).min(b.len()) & !31;
+    let total_len = dst.len().min(a.len()).min(b.len());
+    let len = total_len & !31;
     let (dst_ptr, a_ptr, b_ptr) = (dst.as_mut_ptr(), a.as_ptr(), b.as_ptr());
     let mut offset = 0;
     while offset < len {
@@ -1087,7 +1179,17 @@ unsafe fn elementwise_gfni_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
         }
         offset += 32;
     }
-    for ((d, &x), &y) in dst[len..].iter_mut().zip(&a[len..]).zip(&b[len..]) {
+    let mut offset = len;
+    if offset + 16 <= total_len {
+        // SAFETY: `offset + 16 <= total_len` bounds all three slices.
+        unsafe {
+            let x = _mm_loadu_si128(a_ptr.add(offset).cast());
+            let y = _mm_loadu_si128(b_ptr.add(offset).cast());
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), _mm_gf2p8mul_epi8(x, y));
+        }
+        offset += 16;
+    }
+    for ((d, &x), &y) in dst[offset..].iter_mut().zip(&a[offset..]).zip(&b[offset..]) {
         *d = Elem(x).mul(Elem(y)).0;
     }
 }
@@ -1135,7 +1237,9 @@ unsafe fn gather_gfni_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
         offset += 128;
     }
     for (&coeff, &src) in coeffs.iter().zip(srcs) {
-        mul_add_nibble(&mut dst[len..], scale_table(coeff), &src[len..]);
+        // SAFETY: the destination and source remainders have equal lengths,
+        // and this function's target features match the callee.
+        unsafe { mul_add_gfni_impl(&mut dst[len..], coeff, &src[len..]) }
     }
 }
 
@@ -1204,11 +1308,15 @@ unsafe fn gather_avx2_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
             offset += 64;
         }
         for slot in 0..count {
-            mul_add_nibble(
-                &mut dst[len..],
-                scale_table(coeffs[group + slot]),
-                &srcs[group + slot][len..],
-            );
+            // SAFETY: AVX2 implies SSSE3; the destination and source
+            // remainders have equal lengths.
+            unsafe {
+                mul_add_avx2_impl(
+                    &mut dst[len..],
+                    scale_table(coeffs[group + slot]),
+                    &srcs[group + slot][len..],
+                );
+            }
         }
     }
 }
@@ -1271,11 +1379,15 @@ unsafe fn gather_ssse3_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
             offset += 64;
         }
         for slot in 0..count {
-            mul_add_nibble(
-                &mut dst[len..],
-                scale_table(coeffs[group + slot]),
-                &srcs[group + slot][len..],
-            );
+            // SAFETY: this function runs under SSSE3, and the destination and
+            // source remainders have equal lengths.
+            unsafe {
+                mul_add_ssse3_impl(
+                    &mut dst[len..],
+                    scale_table(coeffs[group + slot]),
+                    &srcs[group + slot][len..],
+                );
+            }
         }
     }
 }
@@ -1331,14 +1443,17 @@ unsafe fn scatter_avx2_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], sr
             offset += 32;
         }
         for slot in 0..count {
-            // SAFETY: this is one row's disjoint scalar tail.
+            // SAFETY: this is one row's disjoint tail, and AVX2 implies
+            // SSSE3. The remainder keeps equal source and destination lengths.
             let tail = unsafe {
                 core::slice::from_raw_parts_mut(
                     base.add((group + slot) * row_len + vector_len),
                     row_len - vector_len,
                 )
             };
-            mul_add_nibble(tail, scale_table(coeffs[group + slot]), &src[vector_len..]);
+            unsafe {
+                mul_add_ssse3_impl(tail, scale_table(coeffs[group + slot]), &src[vector_len..]);
+            }
         }
     }
 }
@@ -1413,17 +1528,26 @@ pub(crate) fn matrix_avx2(
     nrows: usize,
     terms: &[(&[Elem], &[u8])],
 ) {
+    matrix_avx2_with(rows, row_len, nrows, terms);
+}
+
+pub(crate) fn matrix_avx2_with<M: Matrix<Elem> + ?Sized>(
+    rows: &mut [u8],
+    row_len: usize,
+    nrows: usize,
+    terms: &M,
+) {
     // SAFETY: the selected backend guarantees AVX2 and geometry was checked.
     unsafe { matrix_avx2_impl(rows, row_len, nrows, terms) }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "avx2")]
-unsafe fn matrix_avx2_impl(
+unsafe fn matrix_avx2_impl<M: Matrix<Elem> + ?Sized>(
     rows: &mut [u8],
     row_len: usize,
     nrows: usize,
-    terms: &[(&[Elem], &[u8])],
+    terms: &M,
 ) {
     if row_len == 0 {
         return;
@@ -1443,11 +1567,12 @@ unsafe fn matrix_avx2_impl(
                     *value = _mm256_loadu_si256(base.add((group + slot) * row_len + offset).cast());
                 }
             }
-            for &(coeffs, src) in terms {
+            for term in 0..terms.len() {
+                let src = terms.source(term);
                 // SAFETY: every term source is exactly `row_len` bytes.
                 let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast()) };
-                for slot in 0..count {
-                    let table = scale_table(coeffs[group + slot]);
+                for (slot, value) in acc.iter_mut().take(count).enumerate() {
+                    let table = scale_table(*terms.coefficient(term, group + slot));
                     // SAFETY: each table half is exactly 16 bytes.
                     unsafe {
                         let lo =
@@ -1461,7 +1586,7 @@ unsafe fn matrix_avx2_impl(
                                 _mm256_and_si256(_mm256_srli_epi16::<4>(x), mask),
                             ),
                         );
-                        acc[slot] = _mm256_xor_si256(acc[slot], product);
+                        *value = _mm256_xor_si256(*value, product);
                     }
                 }
             }
@@ -1474,15 +1599,18 @@ unsafe fn matrix_avx2_impl(
             offset += 32;
         }
         for slot in 0..count {
-            // SAFETY: this is the selected row's disjoint scalar tail.
+            // SAFETY: this is the selected row's disjoint tail, AVX2 implies
+            // SSSE3, and every source remainder has the same length.
             let tail = unsafe {
                 core::slice::from_raw_parts_mut(
                     base.add((group + slot) * row_len + vector_len),
                     row_len - vector_len,
                 )
             };
-            for &(coeffs, src) in terms {
-                mul_add_nibble(tail, scale_table(coeffs[group + slot]), &src[vector_len..]);
+            for term in 0..terms.len() {
+                let src = terms.source(term);
+                let table = scale_table(*terms.coefficient(term, group + slot));
+                unsafe { mul_add_ssse3_impl(tail, table, &src[vector_len..]) };
             }
         }
         group += count;
@@ -1497,17 +1625,26 @@ pub(crate) fn matrix_ssse3(
     nrows: usize,
     terms: &[(&[Elem], &[u8])],
 ) {
+    matrix_ssse3_with(rows, row_len, nrows, terms);
+}
+
+pub(crate) fn matrix_ssse3_with<M: Matrix<Elem> + ?Sized>(
+    rows: &mut [u8],
+    row_len: usize,
+    nrows: usize,
+    terms: &M,
+) {
     // SAFETY: the selected backend guarantees SSSE3 and geometry was checked.
     unsafe { matrix_ssse3_impl(rows, row_len, nrows, terms) }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "ssse3")]
-unsafe fn matrix_ssse3_impl(
+unsafe fn matrix_ssse3_impl<M: Matrix<Elem> + ?Sized>(
     rows: &mut [u8],
     row_len: usize,
     nrows: usize,
-    terms: &[(&[Elem], &[u8])],
+    terms: &M,
 ) {
     if row_len == 0 {
         return;
@@ -1527,11 +1664,12 @@ unsafe fn matrix_ssse3_impl(
                     *value = _mm_loadu_si128(base.add((group + slot) * row_len + offset).cast());
                 }
             }
-            for &(coeffs, src) in terms {
+            for term in 0..terms.len() {
+                let src = terms.source(term);
                 // SAFETY: every term source is exactly `row_len` bytes.
                 let x = unsafe { _mm_loadu_si128(src.as_ptr().add(offset).cast()) };
-                for slot in 0..count {
-                    let table = scale_table(coeffs[group + slot]);
+                for (slot, value) in acc.iter_mut().take(count).enumerate() {
+                    let table = scale_table(*terms.coefficient(term, group + slot));
                     // SAFETY: each table half is exactly 16 bytes.
                     unsafe {
                         let lo = _mm_loadu_si128(table.lo.as_ptr().cast());
@@ -1540,7 +1678,7 @@ unsafe fn matrix_ssse3_impl(
                             _mm_shuffle_epi8(lo, _mm_and_si128(x, mask)),
                             _mm_shuffle_epi8(hi, _mm_and_si128(_mm_srli_epi16::<4>(x), mask)),
                         );
-                        acc[slot] = _mm_xor_si128(acc[slot], product);
+                        *value = _mm_xor_si128(*value, product);
                     }
                 }
             }
@@ -1560,8 +1698,10 @@ unsafe fn matrix_ssse3_impl(
                     row_len - vector_len,
                 )
             };
-            for &(coeffs, src) in terms {
-                mul_add_nibble(tail, scale_table(coeffs[group + slot]), &src[vector_len..]);
+            for term in 0..terms.len() {
+                let src = terms.source(term);
+                let table = scale_table(*terms.coefficient(term, group + slot));
+                mul_add_nibble(tail, table, &src[vector_len..]);
             }
         }
         group += count;
