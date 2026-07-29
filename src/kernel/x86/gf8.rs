@@ -14,11 +14,9 @@
 //!   against a [`ScaleTable`]. `PSHUFB` indexes within each 128-bit half, so
 //!   the AVX2 form broadcasts the 16-byte table into both halves first.
 //!
-//! Buffer lengths are arbitrary, so every loop hands its sub-lane remainder
-//! to the scalar nibble kernels in [`crate::kernel::gf8`]. The GFNI entry
-//! points carry a coefficient rather than a table and borrow one from the
-//! shared bank ([`scale_table`]) for that tail — an index into a `static`,
-//! not a table build.
+//! Buffer lengths are arbitrary, so x86 kernels descend through 32-byte and
+//! 16-byte SIMD lanes before handing only the sub-XMM remainder to the scalar
+//! nibble kernels in [`crate::kernel::gf8`].
 
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
@@ -47,6 +45,7 @@ pub(crate) fn mul_add_gfni(dst: &mut [u8], coeff: Elem, src: &[u8]) {
 #[target_feature(enable = "avx2,gfni")]
 unsafe fn mul_add_gfni_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     let factor = _mm256_set1_epi8(coeff.0.cast_signed());
+    let factor128 = _mm256_castsi256_si128(factor);
     let len = dst.len();
     let (dst_ptr, src_ptr) = (dst.as_mut_ptr(), src.as_ptr());
     let mut offset = 0;
@@ -88,6 +87,16 @@ unsafe fn mul_add_gfni_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
         }
         offset += 32;
     }
+    if offset + 16 <= len {
+        // SAFETY: `offset + 16 <= len == dst.len() == src.len()`.
+        unsafe {
+            let x = _mm_loadu_si128(src_ptr.add(offset).cast());
+            let d = _mm_loadu_si128(dst_ptr.add(offset).cast());
+            let r = _mm_xor_si128(d, _mm_gf2p8mul_epi8(x, factor128));
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), r);
+        }
+        offset += 16;
+    }
 
     mul_add_nibble(&mut dst[offset..], scale_table(coeff), &src[offset..]);
 }
@@ -102,6 +111,7 @@ pub(crate) fn mul_assign_gfni(dst: &mut [u8], coeff: Elem) {
 #[target_feature(enable = "avx2,gfni")]
 unsafe fn mul_assign_gfni_impl(dst: &mut [u8], coeff: Elem) {
     let factor = _mm256_set1_epi8(coeff.0.cast_signed());
+    let factor128 = _mm256_castsi256_si128(factor);
     let len = dst.len() & !31;
     let dst_ptr = dst.as_mut_ptr();
     let mut offset = 0;
@@ -115,8 +125,17 @@ unsafe fn mul_assign_gfni_impl(dst: &mut [u8], coeff: Elem) {
         }
         offset += 32;
     }
+    let mut offset = len;
+    if offset + 16 <= dst.len() {
+        // SAFETY: `offset + 16 <= dst.len()`.
+        unsafe {
+            let d = _mm_loadu_si128(dst_ptr.add(offset).cast());
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), _mm_gf2p8mul_epi8(d, factor128));
+        }
+        offset += 16;
+    }
 
-    mul_assign_nibble(&mut dst[len..], scale_table(coeff));
+    mul_assign_nibble(&mut dst[offset..], scale_table(coeff));
 }
 
 /// `dst = coeff * src` using `GF2P8MULB` over 32-byte lanes.
@@ -137,6 +156,7 @@ pub(crate) fn mul_into_gfni(dst: &mut [u8], coeff: Elem, src: &[u8]) {
 #[target_feature(enable = "avx2,gfni")]
 unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     let factor = _mm256_set1_epi8(coeff.0.cast_signed());
+    let factor128 = _mm256_castsi256_si128(factor);
     let len = dst.len();
     let (dst_ptr, src_ptr) = (dst.as_mut_ptr(), src.as_ptr());
     let mut offset = 0;
@@ -167,6 +187,14 @@ unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
             _mm256_storeu_si256(dst_ptr.add(offset).cast(), _mm256_gf2p8mul_epi8(x, factor));
         }
         offset += 32;
+    }
+    if offset + 16 <= len {
+        // SAFETY: `offset + 16 <= len == dst.len() == src.len()`.
+        unsafe {
+            let x = _mm_loadu_si128(src_ptr.add(offset).cast());
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), _mm_gf2p8mul_epi8(x, factor128));
+        }
+        offset += 16;
     }
 
     mul_into_nibble(&mut dst[offset..], scale_table(coeff), &src[offset..]);
@@ -229,6 +257,7 @@ pub(crate) fn mul_add_ssse3(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     unsafe { mul_add_ssse3_impl(dst, table, src) }
 }
 
+#[inline]
 #[target_feature(enable = "ssse3")]
 unsafe fn mul_add_ssse3_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     // SAFETY: `lo` and `hi` are 16-byte arrays, exactly one `__m128i` each.
@@ -298,7 +327,8 @@ unsafe fn mul_into_avx2_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
         offset += 32;
     }
 
-    mul_into_nibble(&mut dst[len..], table, &src[len..]);
+    // SAFETY: AVX2 implies SSSE3, and the remainders keep equal lengths.
+    unsafe { mul_into_ssse3_impl(&mut dst[len..], table, &src[len..]) }
 }
 
 /// `dst = coeff * dst` by nibble shuffle over 32-byte lanes.
@@ -342,6 +372,7 @@ pub(crate) fn mul_assign_ssse3(dst: &mut [u8], table: &ScaleTable) {
     unsafe { mul_assign_ssse3_impl(dst, table) }
 }
 
+#[inline]
 #[target_feature(enable = "ssse3")]
 unsafe fn mul_assign_ssse3_impl(dst: &mut [u8], table: &ScaleTable) {
     // SAFETY: `lo` and `hi` are 16-byte arrays, exactly one `__m128i` each.
@@ -384,6 +415,7 @@ pub(crate) fn mul_into_ssse3(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     unsafe { mul_into_ssse3_impl(dst, table, src) }
 }
 
+#[inline]
 #[target_feature(enable = "ssse3")]
 unsafe fn mul_into_ssse3_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     // SAFETY: `lo` and `hi` are 16-byte arrays, exactly one `__m128i` each.
@@ -499,12 +531,10 @@ unsafe fn scatter_gfni_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], sr
 /// destination is ours to choose.
 #[inline]
 fn peel_to_align(ptr: *const u8, len: usize) -> usize {
-    // The peel runs on the scalar kernel, so it only pays once the vector
-    // body is long enough to hide it. Measured on this machine with a
-    // 16-byte-aligned destination and eight rows, peeling wins from about
-    // 2 KiB up (2 KiB: 67 -> 74 GiB/s, 3 KiB: 64 -> 90, 4 KiB: 64 -> 99) and
-    // loses badly below 1 KiB, where 31 scalar bytes swamp the row (128 B:
-    // 23 -> 9). Sixteen turns of the 128-byte body is the crossover.
+    // The peel uses 128-bit GFNI where possible and scalar code below one XMM
+    // lane. Keep the conservative crossover measured for the former all-scalar
+    // peel: it won from about 2 KiB up and lost badly below 1 KiB. Sixteen
+    // turns of the 128-byte body remains the floor.
     const FLOOR: usize = 16 * 128;
     let head = ptr.align_offset(32);
     // `align_offset` reports `usize::MAX` only for an unreachable alignment,
@@ -654,13 +684,16 @@ unsafe fn scatter_rows2(ptrs: [*mut u8; 2], coeffs: [Elem; 2], src: &[u8]) {
     unsafe { scatter_span(ptrs.iter().zip(&coeffs), offset, len, src) }
 }
 
-/// Scalar span shared by the scatter row groups: apply `src[start..end]` to
-/// the matching bytes of every staged row.
+/// Narrow SIMD span shared by the GFNI scatter row groups.
+///
+/// Processes complete 16-byte lanes with GFNI and leaves fewer than 16 bytes
+/// to the scalar nibble kernel.
 ///
 /// # Safety
 /// Every pointer must address a distinct, in-bounds row of at least
-/// `src.len()` bytes, `start..end` must lie within `0..=src.len()`, and no
-/// slice into those rows may be live.
+/// `src.len()` bytes, `start..end` must lie within `0..=src.len()`, no slice
+/// into those rows may be live, and the caller must have selected GFNI.
+#[target_feature(enable = "sse2,gfni")]
 unsafe fn scatter_span<'a>(
     rows: impl Iterator<Item = (&'a *mut u8, &'a Elem)>,
     start: usize,
@@ -670,12 +703,28 @@ unsafe fn scatter_span<'a>(
     if start >= end {
         return;
     }
+    let vector_end = start + ((end - start) & !15);
     for (&row, &coeff) in rows {
-        // SAFETY: `start..end` lies inside `0..src.len()`, the common row
-        // length, so this is a sub-range of the row itself; the rows are
-        // disjoint and only one slice is live at a time.
-        let dst = unsafe { core::slice::from_raw_parts_mut(row.add(start), end - start) };
-        mul_add_nibble(dst, scale_table(coeff), &src[start..end]);
+        let factor = _mm_set1_epi8(coeff.0.cast_signed());
+        let mut offset = start;
+        while offset < vector_end {
+            // SAFETY: `offset + 16 <= vector_end <= end <= src.len()` bounds
+            // both source and row accesses.
+            unsafe {
+                let x = _mm_loadu_si128(src.as_ptr().add(offset).cast());
+                let ptr = row.add(offset);
+                let d = _mm_loadu_si128(ptr.cast());
+                _mm_storeu_si128(ptr.cast(), _mm_xor_si128(d, _mm_gf2p8mul_epi8(x, factor)));
+            }
+            offset += 16;
+        }
+        if vector_end < end {
+            // SAFETY: `vector_end..end` is the row's final sub-lane span; rows
+            // are disjoint and only one mutable slice is live at a time.
+            let dst =
+                unsafe { core::slice::from_raw_parts_mut(row.add(vector_end), end - vector_end) };
+            mul_add_nibble(dst, scale_table(coeff), &src[vector_end..end]);
+        }
     }
 }
 
@@ -1028,14 +1077,17 @@ unsafe fn matrix_rows1(ptr: *mut u8, row_len: usize, g: usize, terms: &[(&[Elem]
     unsafe { matrix_tail(&[ptr], row_len, g, tile, terms) }
 }
 
-/// Scalar remainder shared by the matrix row groups: fold every term into the
-/// last `row_len - tile` bytes of each row.
+/// Hierarchical remainder shared by the GFNI matrix row groups.
+///
+/// Complete 32- and 16-byte lanes stay on GFNI through
+/// [`mul_add_gfni_impl`]; only the final sub-XMM bytes use scalar arithmetic.
 ///
 /// # Safety
 /// Every pointer must address a distinct, in-bounds row of `row_len` bytes,
-/// no slice into those rows may be live, and every term must supply
-/// coefficients through `g + ptrs.len() - 1` over a source of `row_len`
-/// bytes.
+/// no slice into those rows may be live, every term must supply coefficients
+/// through `g + ptrs.len() - 1` over a source of `row_len` bytes, and the
+/// caller must have selected AVX2 + GFNI.
+#[target_feature(enable = "avx2,gfni")]
 unsafe fn matrix_tail(
     ptrs: &[*mut u8],
     row_len: usize,
@@ -1055,7 +1107,9 @@ unsafe fn matrix_tail(
         for &(coeffs, src) in terms {
             let coeff = coeffs[g + slot];
             if coeff.0 != 0 {
-                mul_add_nibble(tail, scale_table(coeff), &src[tile..]);
+                // SAFETY: the tail and source remainder have equal lengths,
+                // and this function's target features match the callee.
+                unsafe { mul_add_gfni_impl(tail, coeff, &src[tile..]) }
             }
         }
     }
@@ -1075,7 +1129,8 @@ pub(crate) fn elementwise_gfni(dst: &mut [u8], a: &[u8], b: &[u8]) {
 
 #[target_feature(enable = "avx2,gfni")]
 unsafe fn elementwise_gfni_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
-    let len = dst.len().min(a.len()).min(b.len()) & !31;
+    let total_len = dst.len().min(a.len()).min(b.len());
+    let len = total_len & !31;
     let (dst_ptr, a_ptr, b_ptr) = (dst.as_mut_ptr(), a.as_ptr(), b.as_ptr());
     let mut offset = 0;
     while offset < len {
@@ -1087,7 +1142,17 @@ unsafe fn elementwise_gfni_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
         }
         offset += 32;
     }
-    for ((d, &x), &y) in dst[len..].iter_mut().zip(&a[len..]).zip(&b[len..]) {
+    let mut offset = len;
+    if offset + 16 <= total_len {
+        // SAFETY: `offset + 16 <= total_len` bounds all three slices.
+        unsafe {
+            let x = _mm_loadu_si128(a_ptr.add(offset).cast());
+            let y = _mm_loadu_si128(b_ptr.add(offset).cast());
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), _mm_gf2p8mul_epi8(x, y));
+        }
+        offset += 16;
+    }
+    for ((d, &x), &y) in dst[offset..].iter_mut().zip(&a[offset..]).zip(&b[offset..]) {
         *d = Elem(x).mul(Elem(y)).0;
     }
 }
@@ -1135,7 +1200,9 @@ unsafe fn gather_gfni_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
         offset += 128;
     }
     for (&coeff, &src) in coeffs.iter().zip(srcs) {
-        mul_add_nibble(&mut dst[len..], scale_table(coeff), &src[len..]);
+        // SAFETY: the destination and source remainders have equal lengths,
+        // and this function's target features match the callee.
+        unsafe { mul_add_gfni_impl(&mut dst[len..], coeff, &src[len..]) }
     }
 }
 
@@ -1204,11 +1271,15 @@ unsafe fn gather_avx2_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
             offset += 64;
         }
         for slot in 0..count {
-            mul_add_nibble(
-                &mut dst[len..],
-                scale_table(coeffs[group + slot]),
-                &srcs[group + slot][len..],
-            );
+            // SAFETY: AVX2 implies SSSE3; the destination and source
+            // remainders have equal lengths.
+            unsafe {
+                mul_add_avx2_impl(
+                    &mut dst[len..],
+                    scale_table(coeffs[group + slot]),
+                    &srcs[group + slot][len..],
+                );
+            }
         }
     }
 }
@@ -1271,11 +1342,15 @@ unsafe fn gather_ssse3_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
             offset += 64;
         }
         for slot in 0..count {
-            mul_add_nibble(
-                &mut dst[len..],
-                scale_table(coeffs[group + slot]),
-                &srcs[group + slot][len..],
-            );
+            // SAFETY: this function runs under SSSE3, and the destination and
+            // source remainders have equal lengths.
+            unsafe {
+                mul_add_ssse3_impl(
+                    &mut dst[len..],
+                    scale_table(coeffs[group + slot]),
+                    &srcs[group + slot][len..],
+                );
+            }
         }
     }
 }
@@ -1331,14 +1406,17 @@ unsafe fn scatter_avx2_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], sr
             offset += 32;
         }
         for slot in 0..count {
-            // SAFETY: this is one row's disjoint scalar tail.
+            // SAFETY: this is one row's disjoint tail, and AVX2 implies
+            // SSSE3. The remainder keeps equal source and destination lengths.
             let tail = unsafe {
                 core::slice::from_raw_parts_mut(
                     base.add((group + slot) * row_len + vector_len),
                     row_len - vector_len,
                 )
             };
-            mul_add_nibble(tail, scale_table(coeffs[group + slot]), &src[vector_len..]);
+            unsafe {
+                mul_add_ssse3_impl(tail, scale_table(coeffs[group + slot]), &src[vector_len..]);
+            }
         }
     }
 }
@@ -1474,7 +1552,8 @@ unsafe fn matrix_avx2_impl(
             offset += 32;
         }
         for slot in 0..count {
-            // SAFETY: this is the selected row's disjoint scalar tail.
+            // SAFETY: this is the selected row's disjoint tail, AVX2 implies
+            // SSSE3, and every source remainder has the same length.
             let tail = unsafe {
                 core::slice::from_raw_parts_mut(
                     base.add((group + slot) * row_len + vector_len),
@@ -1482,7 +1561,9 @@ unsafe fn matrix_avx2_impl(
                 )
             };
             for &(coeffs, src) in terms {
-                mul_add_nibble(tail, scale_table(coeffs[group + slot]), &src[vector_len..]);
+                unsafe {
+                    mul_add_ssse3_impl(tail, scale_table(coeffs[group + slot]), &src[vector_len..]);
+                }
             }
         }
         group += count;

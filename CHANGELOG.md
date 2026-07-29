@@ -26,6 +26,7 @@ All notable changes to this project are documented here. The format follows
 - Row geometry and panic messages are consistent across vector operations.
 - Internal scalar kernels, SIMD table layouts, and raw XOR dispatch are no
   longer public semver surface.
+- x86 GF(2^8) kernels retain SIMD processing through 16-byte tails.
 
 ## [0.1.0] - Unreleased
 
