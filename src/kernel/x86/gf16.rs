@@ -26,8 +26,41 @@
 //! blocking buys nothing there.
 
 use crate::field::gf16::Elem;
-use crate::kernel::gf16::{mul_add_scalar, mul_assign_scalar, mul_into_scalar};
+use crate::kernel::Matrix;
+use crate::kernel::gf16::{Prepared, mul_add_scalar, mul_assign_scalar, mul_into_scalar};
 use crate::kernel::tables::{TowerCoeff, TowerTables};
+
+pub(crate) trait TableCoefficient {
+    fn coefficient(&self) -> Elem;
+    fn with_tables<R>(&self, consume: impl FnOnce(&TowerTables) -> R) -> R;
+}
+
+impl TableCoefficient for Elem {
+    #[inline]
+    fn coefficient(&self) -> Elem {
+        *self
+    }
+
+    #[inline]
+    fn with_tables<R>(&self, consume: impl FnOnce(&TowerTables) -> R) -> R {
+        consume(&TowerTables::new(*self))
+    }
+}
+
+impl TableCoefficient for Prepared {
+    #[inline]
+    fn coefficient(&self) -> Elem {
+        self.coeff()
+    }
+
+    #[inline]
+    fn with_tables<R>(&self, consume: impl FnOnce(&TowerTables) -> R) -> R {
+        match self {
+            Prepared::Tables(tables) => consume(tables),
+            other => consume(&TowerTables::new(other.coeff())),
+        }
+    }
+}
 
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
@@ -716,26 +749,29 @@ pub(crate) fn matrix_gfni(
     nrows: usize,
     terms: &[(&[Elem], &[u8])],
 ) {
-    debug_assert!(
-        terms
-            .iter()
-            .all(|&(coeffs, src)| coeffs.len() == nrows && src.len() == row_len)
-    );
-    if row_len == 0 || nrows == 0 || terms.is_empty() {
+    matrix_gfni_with(rows, row_len, nrows, terms);
+}
+
+pub(crate) fn matrix_gfni_with<M: Matrix<Elem> + ?Sized>(
+    rows: &mut [u8],
+    row_len: usize,
+    nrows: usize,
+    terms: &M,
+) {
+    if row_len == 0 || nrows == 0 || terms.len() == 0 {
         return;
     }
-    let mut nrows = nrows.min(rows.len() / row_len);
+    let nrows = nrows.min(rows.len() / row_len);
     let mut span = row_len;
-    for &(coeffs, src) in terms {
-        nrows = nrows.min(coeffs.len());
-        span = span.min(src.len());
+    for term in 0..terms.len() {
+        span = span.min(terms.source(term).len());
     }
     if nrows == 0 || span == 0 {
         return;
     }
     // SAFETY: the caller selected the GFNI backend, so AVX2 and GFNI are
-    // present. `nrows` is clamped to what `rows` holds and to the shortest
-    // coefficient array; `span` to the shortest source.
+    // present. `nrows` is clamped to what `rows` holds and `span` to the
+    // shortest source.
     unsafe { matrix_gfni_impl(rows, row_len, span, nrows, terms) }
 }
 
@@ -744,12 +780,12 @@ pub(crate) fn matrix_gfni(
 /// term must supply at least `nrows` coefficients, and `span` must be at most
 /// `stride` and at most every term's source length.
 #[target_feature(enable = "avx2,gfni")]
-unsafe fn matrix_gfni_impl(
+unsafe fn matrix_gfni_impl<M: Matrix<Elem> + ?Sized>(
     rows: &mut [u8],
     stride: usize,
     span: usize,
     nrows: usize,
-    terms: &[(&[Elem], &[u8])],
+    terms: &M,
 ) {
     let base = rows.as_mut_ptr();
     let swap = swap_mask256();
@@ -757,17 +793,17 @@ unsafe fn matrix_gfni_impl(
     while j + 4 <= nrows {
         // SAFETY: rows `j..j + 4` lie within `rows` and, being `stride` bytes
         // apart with a `span <= stride` window, are pairwise disjoint.
-        unsafe { matrix_group_gfni::<4>(base.add(j * stride), stride, span, j, terms, swap) };
+        unsafe { matrix_group_gfni::<4, M>(base.add(j * stride), stride, span, j, terms, swap) };
         j += 4;
     }
     if j + 2 <= nrows {
         // SAFETY: as above, for the two-row remainder.
-        unsafe { matrix_group_gfni::<2>(base.add(j * stride), stride, span, j, terms, swap) };
+        unsafe { matrix_group_gfni::<2, M>(base.add(j * stride), stride, span, j, terms, swap) };
         j += 2;
     }
     if j < nrows {
         // SAFETY: as above, for the final row.
-        unsafe { matrix_group_gfni::<1>(base.add(j * stride), stride, span, j, terms, swap) };
+        unsafe { matrix_group_gfni::<1, M>(base.add(j * stride), stride, span, j, terms, swap) };
     }
 }
 
@@ -780,12 +816,12 @@ unsafe fn matrix_gfni_impl(
 /// than `first + N - 1` coefficients, and `span` must not exceed any term's
 /// source length.
 #[target_feature(enable = "avx2,gfni")]
-unsafe fn matrix_group_gfni<const N: usize>(
+unsafe fn matrix_group_gfni<const N: usize, M: Matrix<Elem> + ?Sized>(
     base: *mut u8,
     stride: usize,
     span: usize,
     first: usize,
-    terms: &[(&[Elem], &[u8])],
+    terms: &M,
     swap: __m256i,
 ) {
     let mut rows = [core::ptr::null_mut::<u8>(); N];
@@ -794,15 +830,16 @@ unsafe fn matrix_group_gfni<const N: usize>(
         *row = unsafe { base.add(k * stride) };
     }
 
-    for block in terms.chunks(TERM_BLOCK) {
+    for block_start in (0..terms.len()).step_by(TERM_BLOCK) {
+        let block_len = (terms.len() - block_start).min(TERM_BLOCK);
         // Every coefficient of the block is derived exactly once, here,
-        // outside the byte loop. Kept as the raw broadcast words rather than
-        // as vectors: `vpbroadcastw` reads memory directly, so a register
-        // spilled to the stack would cost the same reload anyway.
+        // outside the byte loop. Kept as raw broadcast words because
+        // `vpbroadcastw` can read them directly from memory.
         let mut words = [[(0i16, 0i16); N]; TERM_BLOCK];
-        for (t, &(coeffs, _)) in block.iter().enumerate() {
-            for (k, slot) in words[t].iter_mut().enumerate() {
-                *slot = broadcast_words(TowerCoeff::new(coeffs[first + k]));
+        for (t, row_words) in words.iter_mut().take(block_len).enumerate() {
+            for (k, slot) in row_words.iter_mut().enumerate() {
+                let coeff = *terms.coefficient(block_start + t, first + k);
+                *slot = broadcast_words(TowerCoeff::new(coeff));
             }
         }
 
@@ -813,12 +850,13 @@ unsafe fn matrix_group_gfni<const N: usize>(
                 // SAFETY: `offset + 32 <= span` bounds this row's load.
                 *a = unsafe { _mm256_loadu_si256(rows[k].add(offset).cast()) };
             }
-            for (t, &(_, src)) in block.iter().enumerate() {
+            for (t, row_words) in words.iter().take(block_len).enumerate() {
+                let src = terms.source(block_start + t);
                 // SAFETY: `offset + 32 <= span <= src.len()`.
                 let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast()) };
                 let swapped = _mm256_shuffle_epi8(x, swap);
                 for (k, a) in acc.iter_mut().enumerate() {
-                    let (same, cross) = words[t][k];
+                    let (same, cross) = row_words[k];
                     let scaled = scale_gfni(
                         x,
                         swapped,
@@ -841,8 +879,9 @@ unsafe fn matrix_group_gfni<const N: usize>(
                 // 32-byte steps leave it on an element boundary.
                 let tail =
                     unsafe { core::slice::from_raw_parts_mut(row.add(offset), span - offset) };
-                for &(coeffs, src) in block {
-                    mul_add_scalar(tail, coeffs[first + k], &src[offset..span]);
+                for term in block_start..block_start + block_len {
+                    let coeff = *terms.coefficient(term, first + k);
+                    mul_add_scalar(tail, coeff, &terms.source(term)[offset..span]);
                 }
             }
         }
@@ -908,7 +947,7 @@ const TERM_TILE: usize = 8;
 
 /// Many sources into one destination, eight coefficients prepared per pass.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn gather_avx2(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
+pub(crate) fn gather_avx2<C: TableCoefficient>(dst: &mut [u8], coeffs: &[C], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
     // SAFETY: the selected backend guarantees AVX2.
     unsafe { gather_avx2_impl(dst, coeffs, srcs) }
@@ -916,13 +955,13 @@ pub(crate) fn gather_avx2(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "avx2")]
-unsafe fn gather_avx2_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
+unsafe fn gather_avx2_impl<C: TableCoefficient>(dst: &mut [u8], coeffs: &[C], srcs: &[&[u8]]) {
     let vector_len = dst.len() & !31;
     for block in (0..coeffs.len()).step_by(TERM_TILE) {
         let count = (coeffs.len() - block).min(TERM_TILE);
-        let tables: [TowerTables; TERM_TILE] =
-            core::array::from_fn(|i| TowerTables::new(coeffs[block + i.min(count - 1)]));
-        let vectors: [NibbleAvx2; TERM_TILE] = core::array::from_fn(|i| nibble_avx2(&tables[i]));
+        let vectors: [NibbleAvx2; TERM_TILE] = core::array::from_fn(|i| {
+            coeffs[block + i.min(count - 1)].with_tables(|tables| nibble_avx2(tables))
+        });
         let mut offset = 0;
         while offset < vector_len {
             // SAFETY: this 32-byte window lies within `dst`.
@@ -940,7 +979,7 @@ unsafe fn gather_avx2_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
         for i in 0..count {
             mul_add_scalar(
                 &mut dst[vector_len..],
-                coeffs[block + i],
+                coeffs[block + i].coefficient(),
                 &srcs[block + i][vector_len..],
             );
         }
@@ -948,20 +987,20 @@ unsafe fn gather_avx2_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
 }
 
 /// Many sources into one destination, eight coefficients prepared per pass.
-pub(crate) fn gather_ssse3(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
+pub(crate) fn gather_ssse3<C: TableCoefficient>(dst: &mut [u8], coeffs: &[C], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
     // SAFETY: the selected backend guarantees SSSE3.
     unsafe { gather_ssse3_impl(dst, coeffs, srcs) }
 }
 
 #[target_feature(enable = "ssse3")]
-unsafe fn gather_ssse3_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
+unsafe fn gather_ssse3_impl<C: TableCoefficient>(dst: &mut [u8], coeffs: &[C], srcs: &[&[u8]]) {
     let vector_len = dst.len() & !15;
     for block in (0..coeffs.len()).step_by(TERM_TILE) {
         let count = (coeffs.len() - block).min(TERM_TILE);
-        let tables: [TowerTables; TERM_TILE] =
-            core::array::from_fn(|i| TowerTables::new(coeffs[block + i.min(count - 1)]));
-        let vectors: [NibbleSsse3; TERM_TILE] = core::array::from_fn(|i| nibble_ssse3(&tables[i]));
+        let vectors: [NibbleSsse3; TERM_TILE] = core::array::from_fn(|i| {
+            coeffs[block + i.min(count - 1)].with_tables(|tables| nibble_ssse3(tables))
+        });
         let mut offset = 0;
         while offset < vector_len {
             // SAFETY: this 16-byte window lies within `dst`.
@@ -979,7 +1018,7 @@ unsafe fn gather_ssse3_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
         for i in 0..count {
             mul_add_scalar(
                 &mut dst[vector_len..],
-                coeffs[block + i],
+                coeffs[block + i].coefficient(),
                 &srcs[block + i][vector_len..],
             );
         }
@@ -1026,13 +1065,23 @@ unsafe fn gather_gfni_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
 }
 
 /// One source into many rows using four AVX2 table sets at a time.
-pub(crate) fn scatter_avx2(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
+pub(crate) fn scatter_avx2<C: TableCoefficient>(
+    rows: &mut [u8],
+    row_len: usize,
+    coeffs: &[C],
+    src: &[u8],
+) {
     // SAFETY: the selected backend guarantees AVX2 and geometry was checked.
     unsafe { scatter_avx2_impl(rows, row_len, coeffs, src) }
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn scatter_avx2_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
+unsafe fn scatter_avx2_impl<C: TableCoefficient>(
+    rows: &mut [u8],
+    row_len: usize,
+    coeffs: &[C],
+    src: &[u8],
+) {
     if row_len == 0 {
         return;
     }
@@ -1040,9 +1089,9 @@ unsafe fn scatter_avx2_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], sr
     let base = rows.as_mut_ptr();
     for group in (0..coeffs.len()).step_by(4) {
         let count = (coeffs.len() - group).min(4);
-        let tables: [TowerTables; 4] =
-            core::array::from_fn(|i| TowerTables::new(coeffs[group + i.min(count - 1)]));
-        let vectors: [NibbleAvx2; 4] = core::array::from_fn(|i| nibble_avx2(&tables[i]));
+        let vectors: [NibbleAvx2; 4] = core::array::from_fn(|i| {
+            coeffs[group + i.min(count - 1)].with_tables(|tables| nibble_avx2(tables))
+        });
         let mut offset = 0;
         while offset < vector_len {
             // SAFETY: this source window is in bounds.
@@ -1070,19 +1119,29 @@ unsafe fn scatter_avx2_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], sr
                     row_len - vector_len,
                 )
             };
-            mul_add_scalar(tail, coeffs[group + slot], &src[vector_len..]);
+            mul_add_scalar(tail, coeffs[group + slot].coefficient(), &src[vector_len..]);
         }
     }
 }
 
 /// One source into many rows using four SSSE3 table sets at a time.
-pub(crate) fn scatter_ssse3(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
+pub(crate) fn scatter_ssse3<C: TableCoefficient>(
+    rows: &mut [u8],
+    row_len: usize,
+    coeffs: &[C],
+    src: &[u8],
+) {
     // SAFETY: the selected backend guarantees SSSE3 and geometry was checked.
     unsafe { scatter_ssse3_impl(rows, row_len, coeffs, src) }
 }
 
 #[target_feature(enable = "ssse3")]
-unsafe fn scatter_ssse3_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
+unsafe fn scatter_ssse3_impl<C: TableCoefficient>(
+    rows: &mut [u8],
+    row_len: usize,
+    coeffs: &[C],
+    src: &[u8],
+) {
     if row_len == 0 {
         return;
     }
@@ -1090,9 +1149,9 @@ unsafe fn scatter_ssse3_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], s
     let base = rows.as_mut_ptr();
     for group in (0..coeffs.len()).step_by(4) {
         let count = (coeffs.len() - group).min(4);
-        let tables: [TowerTables; 4] =
-            core::array::from_fn(|i| TowerTables::new(coeffs[group + i.min(count - 1)]));
-        let vectors: [NibbleSsse3; 4] = core::array::from_fn(|i| nibble_ssse3(&tables[i]));
+        let vectors: [NibbleSsse3; 4] = core::array::from_fn(|i| {
+            coeffs[group + i.min(count - 1)].with_tables(|tables| nibble_ssse3(tables))
+        });
         let mut offset = 0;
         while offset < vector_len {
             // SAFETY: this source window is in bounds.
@@ -1117,7 +1176,7 @@ unsafe fn scatter_ssse3_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], s
                     row_len - vector_len,
                 )
             };
-            mul_add_scalar(tail, coeffs[group + slot], &src[vector_len..]);
+            mul_add_scalar(tail, coeffs[group + slot].coefficient(), &src[vector_len..]);
         }
     }
 }
@@ -1130,17 +1189,26 @@ pub(crate) fn matrix_avx2(
     nrows: usize,
     terms: &[(&[Elem], &[u8])],
 ) {
+    matrix_avx2_with(rows, row_len, nrows, terms);
+}
+
+pub(crate) fn matrix_avx2_with<C: TableCoefficient, M: Matrix<C> + ?Sized>(
+    rows: &mut [u8],
+    row_len: usize,
+    nrows: usize,
+    terms: &M,
+) {
     // SAFETY: the selected backend guarantees AVX2 and geometry was checked.
     unsafe { matrix_avx2_impl(rows, row_len, nrows, terms) }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "avx2")]
-unsafe fn matrix_avx2_impl(
+unsafe fn matrix_avx2_impl<C: TableCoefficient, M: Matrix<C> + ?Sized>(
     rows: &mut [u8],
     row_len: usize,
     nrows: usize,
-    terms: &[(&[Elem], &[u8])],
+    terms: &M,
 ) {
     if row_len == 0 {
         return;
@@ -1151,15 +1219,13 @@ unsafe fn matrix_avx2_impl(
         let row_count = (nrows - group).min(4);
         for block in (0..terms.len()).step_by(TERM_TILE) {
             let term_count = (terms.len() - block).min(TERM_TILE);
-            let tables: [[TowerTables; 4]; TERM_TILE] = core::array::from_fn(|t| {
+            let vectors: [[NibbleAvx2; 4]; TERM_TILE] = core::array::from_fn(|t| {
                 core::array::from_fn(|r| {
-                    TowerTables::new(
-                        terms[block + t.min(term_count - 1)].0[group + r.min(row_count - 1)],
-                    )
+                    terms
+                        .coefficient(block + t.min(term_count - 1), group + r.min(row_count - 1))
+                        .with_tables(|tables| nibble_avx2(tables))
                 })
             });
-            let vectors: [[NibbleAvx2; 4]; TERM_TILE] =
-                core::array::from_fn(|t| core::array::from_fn(|r| nibble_avx2(&tables[t][r])));
             let mut offset = 0;
             while offset < vector_len {
                 let mut acc = [_mm256_setzero_si256(); 4];
@@ -1169,13 +1235,12 @@ unsafe fn matrix_avx2_impl(
                         *slot = _mm256_loadu_si256(base.add((group + r) * row_len + offset).cast());
                     }
                 }
-                for t in 0..term_count {
-                    // SAFETY: every term source is exactly `row_len` bytes.
+                for (t, vector) in vectors.iter().take(term_count).enumerate() {
                     let source = unsafe {
-                        _mm256_loadu_si256(terms[block + t].1.as_ptr().add(offset).cast())
+                        _mm256_loadu_si256(terms.source(block + t).as_ptr().add(offset).cast())
                     };
-                    for r in 0..row_count {
-                        acc[r] = _mm256_xor_si256(acc[r], scale_avx2(source, &vectors[t][r]));
+                    for (value, scale) in acc.iter_mut().zip(vector).take(row_count) {
+                        *value = _mm256_xor_si256(*value, scale_avx2(source, scale));
                     }
                 }
                 // SAFETY: the same disjoint row windows loaded above.
@@ -1194,8 +1259,12 @@ unsafe fn matrix_avx2_impl(
                         row_len - vector_len,
                     )
                 };
-                for &(coeffs, src) in &terms[block..block + term_count] {
-                    mul_add_scalar(tail, coeffs[group + r], &src[vector_len..]);
+                for term in block..block + term_count {
+                    mul_add_scalar(
+                        tail,
+                        terms.coefficient(term, group + r).coefficient(),
+                        &terms.source(term)[vector_len..],
+                    );
                 }
             }
         }
@@ -1209,16 +1278,25 @@ pub(crate) fn matrix_ssse3(
     nrows: usize,
     terms: &[(&[Elem], &[u8])],
 ) {
+    matrix_ssse3_with(rows, row_len, nrows, terms);
+}
+
+pub(crate) fn matrix_ssse3_with<C: TableCoefficient, M: Matrix<C> + ?Sized>(
+    rows: &mut [u8],
+    row_len: usize,
+    nrows: usize,
+    terms: &M,
+) {
     // SAFETY: the selected backend guarantees SSSE3 and geometry was checked.
     unsafe { matrix_ssse3_impl(rows, row_len, nrows, terms) }
 }
 
 #[target_feature(enable = "ssse3")]
-unsafe fn matrix_ssse3_impl(
+unsafe fn matrix_ssse3_impl<C: TableCoefficient, M: Matrix<C> + ?Sized>(
     rows: &mut [u8],
     row_len: usize,
     nrows: usize,
-    terms: &[(&[Elem], &[u8])],
+    terms: &M,
 ) {
     if row_len == 0 {
         return;
@@ -1229,15 +1307,13 @@ unsafe fn matrix_ssse3_impl(
         let row_count = (nrows - group).min(4);
         for block in (0..terms.len()).step_by(TERM_TILE) {
             let term_count = (terms.len() - block).min(TERM_TILE);
-            let tables: [[TowerTables; 4]; TERM_TILE] = core::array::from_fn(|t| {
+            let vectors: [[NibbleSsse3; 4]; TERM_TILE] = core::array::from_fn(|t| {
                 core::array::from_fn(|r| {
-                    TowerTables::new(
-                        terms[block + t.min(term_count - 1)].0[group + r.min(row_count - 1)],
-                    )
+                    terms
+                        .coefficient(block + t.min(term_count - 1), group + r.min(row_count - 1))
+                        .with_tables(|tables| nibble_ssse3(tables))
                 })
             });
-            let vectors: [[NibbleSsse3; 4]; TERM_TILE] =
-                core::array::from_fn(|t| core::array::from_fn(|r| nibble_ssse3(&tables[t][r])));
             let mut offset = 0;
             while offset < vector_len {
                 let mut acc = [_mm_setzero_si128(); 4];
@@ -1247,12 +1323,12 @@ unsafe fn matrix_ssse3_impl(
                         *slot = _mm_loadu_si128(base.add((group + r) * row_len + offset).cast());
                     }
                 }
-                for t in 0..term_count {
-                    // SAFETY: every term source is exactly `row_len` bytes.
-                    let source =
-                        unsafe { _mm_loadu_si128(terms[block + t].1.as_ptr().add(offset).cast()) };
-                    for r in 0..row_count {
-                        acc[r] = _mm_xor_si128(acc[r], scale_ssse3(source, &vectors[t][r]));
+                for (t, vector) in vectors.iter().take(term_count).enumerate() {
+                    let source = unsafe {
+                        _mm_loadu_si128(terms.source(block + t).as_ptr().add(offset).cast())
+                    };
+                    for (value, scale) in acc.iter_mut().zip(vector).take(row_count) {
+                        *value = _mm_xor_si128(*value, scale_ssse3(source, scale));
                     }
                 }
                 // SAFETY: the same disjoint row windows loaded above.
@@ -1271,8 +1347,12 @@ unsafe fn matrix_ssse3_impl(
                         row_len - vector_len,
                     )
                 };
-                for &(coeffs, src) in &terms[block..block + term_count] {
-                    mul_add_scalar(tail, coeffs[group + r], &src[vector_len..]);
+                for term in block..block + term_count {
+                    mul_add_scalar(
+                        tail,
+                        terms.coefficient(term, group + r).coefficient(),
+                        &terms.source(term)[vector_len..],
+                    );
                 }
             }
         }

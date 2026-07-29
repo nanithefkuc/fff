@@ -480,6 +480,60 @@ fn coefficient_plans_drive_all_multi_row_shapes() {
     );
 }
 
+#[cfg(feature = "std")]
+fn assert_blocked_plan_shapes<F: fff::FieldKernels>(row_len: usize, seed: u64) {
+    const NROWS: usize = 5;
+    const NTERMS: usize = 9;
+
+    let coefficient_bytes = noise(NROWS * NTERMS * F::BYTES, seed);
+    let mut values = coefficient_bytes
+        .chunks_exact(F::BYTES)
+        .map(F::read)
+        .collect::<Vec<_>>();
+    values[0] = F::Elem::ZERO;
+    values[1] = F::Elem::ONE;
+
+    let vector_plan = ops::Plan::<F>::new(&values[..NROWS]);
+    let src = noise(row_len, seed + 1);
+    let mut scatter = noise(row_len * NROWS, seed + 2);
+    let mut scatter_want = scatter.clone();
+    ops::mul_add_scatter_with(&mut scatter, row_len, &vector_plan, &src);
+    ops::mul_add_scatter::<F>(&mut scatter_want, row_len, &values[..NROWS], &src);
+    assert_eq!(scatter, scatter_want);
+
+    let gather_sources = (0..NROWS)
+        .map(|index| noise(row_len, seed + 10 + index as u64))
+        .collect::<Vec<_>>();
+    let gather_refs = gather_sources.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let mut gather = noise(row_len, seed + 20);
+    let mut gather_want = gather.clone();
+    ops::mul_add_gather_with(&mut gather, &vector_plan, &gather_refs);
+    ops::mul_add_gather::<F>(&mut gather_want, &values[..NROWS], &gather_refs);
+    assert_eq!(gather, gather_want);
+
+    let matrix_plan = ops::Plan::<F>::matrix(NTERMS, NROWS, &values);
+    let matrix_sources = (0..NTERMS)
+        .map(|index| noise(row_len, seed + 30 + index as u64))
+        .collect::<Vec<_>>();
+    let matrix_refs = matrix_sources.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let raw_terms = values
+        .chunks_exact(NROWS)
+        .zip(matrix_refs.iter().copied())
+        .collect::<Vec<_>>();
+    let mut matrix = noise(row_len * NROWS, seed + 40);
+    let mut matrix_want = matrix.clone();
+    ops::mul_add_matrix_with(&mut matrix, row_len, NROWS, &matrix_plan, &matrix_refs);
+    ops::mul_add_matrix::<F>(&mut matrix_want, row_len, NROWS, &raw_terms);
+    assert_eq!(matrix, matrix_want);
+}
+
+#[test]
+#[cfg(feature = "std")]
+fn blocked_plans_match_raw_operations_across_group_boundaries() {
+    assert_blocked_plan_shapes::<Gf8>(79, 0x370);
+    assert_blocked_plan_shapes::<Gf16>(78, 0x380);
+}
+
 #[test]
 #[cfg(feature = "std")]
 fn packed_element_helpers_round_trip() {

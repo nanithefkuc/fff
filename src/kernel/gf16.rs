@@ -226,6 +226,24 @@ impl FieldKernels for Gf16 {
             _ => scalar::mul_add_scatter::<Gf16>(rows, row_len, coeffs, src),
         }
     }
+    fn mul_add_scatter_plan(
+        rows: &mut [u8],
+        row_len: usize,
+        values: &[Elem],
+        coeffs: &[Prepared],
+        src: &[u8],
+    ) {
+        match backend() {
+            Backend::Avx512 | Backend::Gfni => {
+                Self::mul_add_scatter(rows, row_len, values, src);
+            }
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Avx2 => x86::gf16::scatter_avx2(rows, row_len, coeffs, src),
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Ssse3 => x86::gf16::scatter_ssse3(rows, row_len, coeffs, src),
+            _ => Self::mul_add_scatter_with(rows, row_len, coeffs, src),
+        }
+    }
 
     fn mul_add_gather(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
         match backend() {
@@ -245,6 +263,15 @@ impl FieldKernels for Gf16 {
         }
     }
 
+    fn mul_add_gather_plan(dst: &mut [u8], values: &[Elem], coeffs: &[Prepared], srcs: &[&[u8]]) {
+        match backend() {
+            Backend::Avx512 | Backend::Gfni => Self::mul_add_gather(dst, values, srcs),
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Ssse3 => x86::gf16::gather_ssse3(dst, coeffs, srcs),
+            _ => Self::mul_add_gather_with(dst, coeffs, srcs),
+        }
+    }
+
     fn mul_add_matrix(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
         match backend() {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -260,6 +287,49 @@ impl FieldKernels for Gf16 {
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => wasm32::gf16::matrix_simd128(rows, row_len, nrows, terms),
             _ => scalar::mul_add_matrix::<Gf16>(rows, row_len, nrows, terms),
+        }
+    }
+    fn mul_add_matrix_plan(
+        rows: &mut [u8],
+        row_len: usize,
+        nrows: usize,
+        values: &[Elem],
+        coeffs: &[Prepared],
+        srcs: &[&[u8]],
+    ) {
+        #[cfg(not(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64"))))]
+        let _ = values;
+        #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+        match backend() {
+            Backend::Gfni => {
+                let terms = crate::kernel::FlatMatrix {
+                    coefficients: values,
+                    nrows,
+                    sources: srcs,
+                };
+                x86::gf16::matrix_gfni_with(rows, row_len, nrows, &terms);
+                return;
+            }
+            Backend::Ssse3 => {
+                let terms = crate::kernel::FlatMatrix {
+                    coefficients: coeffs,
+                    nrows,
+                    sources: srcs,
+                };
+                x86::gf16::matrix_ssse3_with(rows, row_len, nrows, &terms);
+                return;
+            }
+            _ => {}
+        }
+        for (term, &src) in srcs.iter().enumerate() {
+            let start = term * nrows;
+            for (row, coeff) in rows
+                .chunks_exact_mut(row_len)
+                .take(nrows)
+                .zip(&coeffs[start..start + nrows])
+            {
+                Self::mul_add(row, coeff, src);
+            }
         }
     }
 

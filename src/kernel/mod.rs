@@ -277,6 +277,56 @@ pub fn has_vector_elementwise<F: FieldKernels>() -> bool {
     F::has_vector_elementwise()
 }
 
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) trait Matrix<C> {
+    fn len(&self) -> usize;
+    fn coefficient(&self, term: usize, row: usize) -> &C;
+    fn source(&self, term: usize) -> &[u8];
+}
+
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+impl<C> Matrix<C> for [(&[C], &[u8])] {
+    #[inline]
+    fn len(&self) -> usize {
+        <[(&[C], &[u8])]>::len(self)
+    }
+
+    #[inline]
+    fn coefficient(&self, term: usize, row: usize) -> &C {
+        &self[term].0[row]
+    }
+
+    #[inline]
+    fn source(&self, term: usize) -> &[u8] {
+        self[term].1
+    }
+}
+
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) struct FlatMatrix<'a, C> {
+    pub(crate) coefficients: &'a [C],
+    pub(crate) nrows: usize,
+    pub(crate) sources: &'a [&'a [u8]],
+}
+
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+impl<C> Matrix<C> for FlatMatrix<'_, C> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.sources.len()
+    }
+
+    #[inline]
+    fn coefficient(&self, term: usize, row: usize) -> &C {
+        &self.coefficients[term * self.nrows + row]
+    }
+
+    #[inline]
+    fn source(&self, term: usize) -> &[u8] {
+        self.sources[term]
+    }
+}
+
 /// The per-field vector kernel contract.
 ///
 /// Implementations own runtime dispatch for their field. Every method's
@@ -387,6 +437,20 @@ pub trait FieldKernels: Field + private::Sealed {
             Self::mul_add(row, coeff, src);
         }
     }
+    /// Prepared-plan scatter with access to both original and resolved
+    /// coefficients.
+    ///
+    /// The default uses the prepared single-row path. Blocked backends may use
+    /// `values` for representations whose preparation is already free.
+    fn mul_add_scatter_plan(
+        rows: &mut [u8],
+        row_len: usize,
+        _values: &[Self::Elem],
+        coeffs: &[Self::Prepared],
+        src: &[u8],
+    ) {
+        Self::mul_add_scatter_with(rows, row_len, coeffs, src);
+    }
 
     /// [`FieldKernels::mul_add_gather`] over already-prepared coefficients.
     ///
@@ -395,6 +459,18 @@ pub trait FieldKernels: Field + private::Sealed {
         for (coeff, &src) in coeffs.iter().zip(srcs) {
             Self::mul_add(dst, coeff, src);
         }
+    }
+    /// Prepared-plan gather with access to both original and resolved
+    /// coefficients.
+    ///
+    /// The default applies prepared AXPY once per source.
+    fn mul_add_gather_plan(
+        dst: &mut [u8],
+        _values: &[Self::Elem],
+        coeffs: &[Self::Prepared],
+        srcs: &[&[u8]],
+    ) {
+        Self::mul_add_gather_with(dst, coeffs, srcs);
     }
 
     /// [`FieldKernels::mul_add_matrix`] over already-prepared coefficients.
@@ -409,6 +485,29 @@ pub trait FieldKernels: Field + private::Sealed {
     ) {
         for &(coeffs, src) in terms {
             for (row, coeff) in rows.chunks_exact_mut(row_len).take(nrows).zip(coeffs) {
+                Self::mul_add(row, coeff, src);
+            }
+        }
+    }
+    /// Prepared-plan matrix using flat row-major coefficients and source rows.
+    ///
+    /// The default is allocation-free repeated prepared AXPY. Register-blocked
+    /// backends may override it and consume the same flat geometry directly.
+    fn mul_add_matrix_plan(
+        rows: &mut [u8],
+        row_len: usize,
+        nrows: usize,
+        _values: &[Self::Elem],
+        coeffs: &[Self::Prepared],
+        srcs: &[&[u8]],
+    ) {
+        for (term, &src) in srcs.iter().enumerate() {
+            let start = term * nrows;
+            for (row, coeff) in rows
+                .chunks_exact_mut(row_len)
+                .take(nrows)
+                .zip(&coeffs[start..start + nrows])
+            {
                 Self::mul_add(row, coeff, src);
             }
         }

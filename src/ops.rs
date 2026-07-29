@@ -164,6 +164,7 @@ impl<F: FieldKernels> PreparedCoefficient<F> for CoeffRef<'_, F> {
 #[cfg(feature = "std")]
 pub struct Plan<F: FieldKernels> {
     prepared: std::boxed::Box<[F::Prepared]>,
+    values: std::boxed::Box<[F::Elem]>,
     rows: usize,
     cols: usize,
 }
@@ -173,7 +174,8 @@ impl<F: FieldKernels> Plan<F> {
     /// Prepare a one-dimensional coefficient vector.
     #[must_use]
     pub fn new(coeffs: &[F::Elem]) -> Self {
-        let prepared = coeffs
+        let values: std::boxed::Box<[F::Elem]> = std::boxed::Box::from(coeffs);
+        let prepared = values
             .iter()
             .copied()
             .map(F::prepare)
@@ -181,6 +183,7 @@ impl<F: FieldKernels> Plan<F> {
             .into_boxed_slice();
         Self {
             prepared,
+            values,
             rows: 1,
             cols: coeffs.len(),
         }
@@ -266,8 +269,9 @@ impl<F: FieldKernels> Plan<F> {
     }
 
     /// Iterate over the original field elements in row-major order.
+    #[must_use]
     pub fn values(&self) -> impl ExactSizeIterator<Item = F::Elem> + '_ {
-        self.prepared.iter().map(F::prepared_coeff)
+        self.values.iter().copied()
     }
 }
 
@@ -276,6 +280,7 @@ impl<F: FieldKernels> Clone for Plan<F> {
     fn clone(&self) -> Self {
         Self {
             prepared: self.prepared.clone(),
+            values: self.values.clone(),
             rows: self.rows,
             cols: self.cols,
         }
@@ -505,7 +510,13 @@ pub fn mul_add_scatter_with<F: FieldKernels>(
     if plan.values().all(Elem::is_zero) {
         return;
     }
-    F::mul_add_scatter_with(&mut rows[..used], row_len, &plan.prepared, src);
+    F::mul_add_scatter_plan(
+        &mut rows[..used],
+        row_len,
+        &plan.values,
+        &plan.prepared,
+        src,
+    );
 }
 
 /// Fold many sources into one row: `dst ^= sum(coeffs[i] * srcs[i])`.
@@ -570,7 +581,7 @@ pub fn mul_add_gather_with<F: FieldKernels>(dst: &mut [u8], plan: &Plan<F>, srcs
     if srcs.is_empty() || plan.values().all(Elem::is_zero) {
         return;
     }
-    F::mul_add_gather_with(dst, &plan.prepared, srcs);
+    F::mul_add_gather_plan(dst, &plan.values, &plan.prepared, srcs);
 }
 
 /// Apply many sources to many rows: for each `(coeffs, src)` term,
@@ -663,15 +674,14 @@ pub fn mul_add_matrix_with<F: FieldKernels>(
     if nrows == 0 || srcs.is_empty() {
         return;
     }
-    let terms = srcs
-        .iter()
-        .enumerate()
-        .map(|(index, &src)| {
-            let start = index * nrows;
-            (&plan.prepared[start..start + nrows], src)
-        })
-        .collect::<std::vec::Vec<_>>();
-    F::mul_add_matrix_with(&mut rows[..used], row_len, nrows, &terms);
+    F::mul_add_matrix_plan(
+        &mut rows[..used],
+        row_len,
+        nrows,
+        &plan.values,
+        &plan.prepared,
+        srcs,
+    );
 }
 
 /// Elementwise product: `dst[i] = a[i] * b[i]`.
