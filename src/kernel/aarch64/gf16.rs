@@ -12,7 +12,7 @@
 //! `b` is `a`'s adjacent-byte neighbour, so the crossed half is the same
 //! alternating byte multiply applied to `vrev16q_u8(source)`, and the four
 //! base coefficients are exactly
-//! [`TowerTables::factors`](crate::kernel::tables::TowerTables::factors).
+//! [`TowerTables::factors`].
 //!
 //! NEON has no byte-wide field multiply, so each base coefficient is a
 //! split-nibble `vqtbl1q_u8` pair — two lookups and an XOR. A whole 16-byte
@@ -39,7 +39,7 @@ const TERM_BLOCK: usize = 8;
 /// The eight lookup vectors one GF(2^16) coefficient needs.
 ///
 /// `lo[i]` and `hi[i]` are the nibble tables of
-/// [`TowerTables::factors`](crate::kernel::tables::TowerTables::factors)`[i]`,
+/// [`TowerTables::factors`]`[i]`,
 /// that is of `[c0, c0+c1, DELTA*c1, c1]`.
 #[derive(Clone, Copy)]
 struct Factors {
@@ -164,7 +164,7 @@ fn scaled_vector(source: uint8x16_t, factors: &Factors) -> uint8x16_t {
 
 /// `dst ^= coeff * src` over interleaved GF(2^16) elements, 16 bytes at a
 /// time.
-pub(crate) fn mul_add_neon(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
+pub fn mul_add_neon(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: NEON is baseline on AArch64, the two slices are independently
     // borrowed, and the loop is bounded by the shorter of the two.
@@ -192,7 +192,7 @@ unsafe fn mul_add_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
 }
 
 /// `dst = coeff * dst` over interleaved GF(2^16) elements.
-pub(crate) fn mul_assign_neon(dst: &mut [u8], tables: &TowerTables) {
+pub fn mul_assign_neon(dst: &mut [u8], tables: &TowerTables) {
     // SAFETY: NEON is baseline on AArch64 and every access below stays
     // inside the single borrowed slice.
     unsafe { mul_assign_impl(dst, tables) }
@@ -286,7 +286,7 @@ unsafe fn scatter_group<const N: usize>(
 }
 
 /// `rows[j] ^= coeffs[j] * src` for every row, four rows per source load.
-pub(crate) fn scatter_neon(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
+pub fn scatter_neon(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
     if row_len == 0 || coeffs.is_empty() || src.is_empty() {
         return;
     }
@@ -461,12 +461,7 @@ unsafe fn matrix_group<const N: usize>(
 }
 
 /// Apply every `(coeffs, src)` term to the leading `nrows` rows.
-pub(crate) fn matrix_neon(
-    rows: &mut [u8],
-    row_len: usize,
-    nrows: usize,
-    terms: &[(&[Elem], &[u8])],
-) {
+pub fn matrix_neon(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
     if row_len == 0 || nrows == 0 || terms.is_empty() {
         return;
     }
@@ -536,7 +531,7 @@ unsafe fn matrix_impl(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&
 /// Each block then sweeps the destination once; the bounded block avoids an
 /// allocation while keeping the expensive four-table preparation out of the
 /// byte loop.
-pub(crate) fn gather_neon(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
+pub fn gather_neon(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
     // SAFETY: NEON is baseline on AArch64 and callers checked source lengths.
     unsafe { gather_impl(dst, coeffs, srcs) }
@@ -597,7 +592,7 @@ fn multiply_base_vectors(mut a: uint8x16_t, mut b: uint8x16_t) -> uint8x16_t {
 }
 
 /// `dst[i] = a[i] * b[i]` over interleaved tower elements.
-pub(crate) fn elementwise_neon(dst: &mut [u8], a: &[u8], b: &[u8]) {
+pub fn elementwise_neon(dst: &mut [u8], a: &[u8], b: &[u8]) {
     debug_assert_eq!(dst.len(), a.len());
     debug_assert_eq!(dst.len(), b.len());
     // SAFETY: NEON is baseline on AArch64 and all three lengths match.
@@ -648,7 +643,7 @@ unsafe fn elementwise_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
 
 /// `dst[i] = a[i] * b[i]` over tower elements using the optional `PMULL`
 /// extension for each base-field product.
-pub(crate) fn elementwise_pmull(dst: &mut [u8], a: &[u8], b: &[u8]) {
+pub fn elementwise_pmull(dst: &mut [u8], a: &[u8], b: &[u8]) {
     debug_assert_eq!(dst.len(), a.len());
     debug_assert_eq!(dst.len(), b.len());
     // SAFETY: dispatch checked the AArch64 `aes` feature, which includes

@@ -36,7 +36,7 @@ use crate::kernel::tables::{ScaleTable, scale_table};
 ///
 /// # Panics
 /// Panics if the slices differ in length.
-pub(crate) fn mul_add_gfni(dst: &mut [u8], coeff: Elem, src: &[u8]) {
+pub fn mul_add_gfni(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the GFNI backend, which detected both AVX2
     // and GFNI; the slices are equal-length and independently borrowed.
@@ -103,7 +103,7 @@ unsafe fn mul_add_gfni_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
 }
 
 /// `dst = coeff * dst` using `GF2P8MULB` over 32-byte lanes.
-pub(crate) fn mul_assign_gfni(dst: &mut [u8], coeff: Elem) {
+pub fn mul_assign_gfni(dst: &mut [u8], coeff: Elem) {
     // SAFETY: the caller selected the GFNI backend, which detected both AVX2
     // and GFNI.
     unsafe { mul_assign_gfni_impl(dst, coeff) }
@@ -147,7 +147,7 @@ unsafe fn mul_assign_gfni_impl(dst: &mut [u8], coeff: Elem) {
 ///
 /// # Panics
 /// Panics if the slices differ in length.
-pub(crate) fn mul_into_gfni(dst: &mut [u8], coeff: Elem, src: &[u8]) {
+pub fn mul_into_gfni(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the GFNI backend, which detected both AVX2
     // and GFNI; the slices are equal-length and independently borrowed.
@@ -209,7 +209,7 @@ unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
 ///
 /// # Panics
 /// Panics if the slices differ in length.
-pub(crate) fn mul_add_avx2(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+pub fn mul_add_avx2(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the AVX2 backend; the slices are
     // equal-length and independently borrowed.
@@ -251,7 +251,7 @@ unsafe fn mul_add_avx2_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
 ///
 /// # Panics
 /// Panics if the slices differ in length.
-pub(crate) fn mul_add_ssse3(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+pub fn mul_add_ssse3(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the SSSE3 backend; the slices are
     // equal-length and independently borrowed.
@@ -296,7 +296,7 @@ unsafe fn mul_add_ssse3_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
 ///
 /// # Panics
 /// Panics if the slices differ in length.
-pub(crate) fn mul_into_avx2(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+pub fn mul_into_avx2(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the AVX2 backend; the slices are
     // equal-length and independently borrowed.
@@ -333,7 +333,7 @@ unsafe fn mul_into_avx2_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
 }
 
 /// `dst = coeff * dst` by nibble shuffle over 32-byte lanes.
-pub(crate) fn mul_assign_avx2(dst: &mut [u8], table: &ScaleTable) {
+pub fn mul_assign_avx2(dst: &mut [u8], table: &ScaleTable) {
     // SAFETY: the caller selected the AVX2 backend.
     unsafe { mul_assign_avx2_impl(dst, table) }
 }
@@ -368,7 +368,7 @@ unsafe fn mul_assign_avx2_impl(dst: &mut [u8], table: &ScaleTable) {
 }
 
 /// `dst = coeff * dst` by nibble shuffle over 16-byte lanes.
-pub(crate) fn mul_assign_ssse3(dst: &mut [u8], table: &ScaleTable) {
+pub fn mul_assign_ssse3(dst: &mut [u8], table: &ScaleTable) {
     // SAFETY: the caller selected the SSSE3 backend.
     unsafe { mul_assign_ssse3_impl(dst, table) }
 }
@@ -409,7 +409,7 @@ unsafe fn mul_assign_ssse3_impl(dst: &mut [u8], table: &ScaleTable) {
 ///
 /// # Panics
 /// Panics if the slices differ in length.
-pub(crate) fn mul_into_ssse3(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+pub fn mul_into_ssse3(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the SSSE3 backend; the slices are
     // equal-length and independently borrowed.
@@ -459,7 +459,7 @@ unsafe fn mul_into_ssse3_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
 /// # Panics
 /// Panics unless `src.len() == row_len` and `rows` holds `coeffs.len()` rows
 /// of `row_len` bytes.
-pub(crate) fn scatter_gfni(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
+pub fn scatter_gfni(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
     assert_eq!(row_len, src.len());
     assert!(
         coeffs
@@ -754,16 +754,16 @@ unsafe fn scatter_span<'a>(
 /// # Panics
 /// Panics unless `rows` holds `nrows` rows of `row_len` bytes and every term
 /// supplies `nrows` coefficients for a source of `row_len` bytes.
-pub(crate) fn matrix_gfni(
-    rows: &mut [u8],
-    row_len: usize,
-    nrows: usize,
-    terms: &[(&[Elem], &[u8])],
-) {
+pub fn matrix_gfni(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
     matrix_gfni_with(rows, row_len, nrows, terms);
 }
 
-pub(crate) fn matrix_gfni_with<M: Matrix<Elem> + ?Sized>(
+/// Many sources into many rows, GFNI backend, over a generic matrix source.
+///
+/// # Panics
+/// Panics unless `rows` holds `nrows` rows of `row_len` bytes and every term
+/// supplies `nrows` coefficients for a source of `row_len` bytes.
+pub fn matrix_gfni_with<M: Matrix<Elem> + ?Sized>(
     rows: &mut [u8],
     row_len: usize,
     nrows: usize,
@@ -1157,7 +1157,7 @@ unsafe fn matrix_tail<M: Matrix<Elem> + ?Sized>(
 // ---------------------------------------------------------------------------
 
 /// `dst[i] = a[i] * b[i]` using vector-by-vector `GF2P8MULB`.
-pub(crate) fn elementwise_gfni(dst: &mut [u8], a: &[u8], b: &[u8]) {
+pub fn elementwise_gfni(dst: &mut [u8], a: &[u8], b: &[u8]) {
     debug_assert_eq!(dst.len(), a.len());
     debug_assert_eq!(dst.len(), b.len());
     // SAFETY: the selected backend guarantees AVX2 and GFNI.
@@ -1195,7 +1195,7 @@ unsafe fn elementwise_gfni_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
 }
 
 /// Many sources into one destination, register-blocked over 128-byte tiles.
-pub(crate) fn gather_gfni(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
+pub fn gather_gfni(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
     // SAFETY: the selected backend guarantees AVX2 and GFNI; callers checked
     // every source length against `dst`.
@@ -1244,7 +1244,7 @@ unsafe fn gather_gfni_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
 }
 
 /// Many sources into one destination using AVX2 nibble shuffles.
-pub(crate) fn gather_avx2(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
+pub fn gather_avx2(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
     // SAFETY: the selected backend guarantees AVX2.
     unsafe { gather_avx2_impl(dst, coeffs, srcs) }
@@ -1322,7 +1322,7 @@ unsafe fn gather_avx2_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
 }
 
 /// Many sources into one destination using SSSE3 nibble shuffles.
-pub(crate) fn gather_ssse3(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
+pub fn gather_ssse3(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
     // SAFETY: the selected backend guarantees SSSE3.
     unsafe { gather_ssse3_impl(dst, coeffs, srcs) }
@@ -1393,7 +1393,7 @@ unsafe fn gather_ssse3_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
 }
 
 /// One source into many rows using one AVX2 source load per tile.
-pub(crate) fn scatter_avx2(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
+pub fn scatter_avx2(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
     debug_assert_eq!(row_len, src.len());
     // SAFETY: the selected backend guarantees AVX2 and row geometry was
     // checked by the public wrapper.
@@ -1459,7 +1459,7 @@ unsafe fn scatter_avx2_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], sr
 }
 
 /// One source into many rows using one SSSE3 source load per tile.
-pub(crate) fn scatter_ssse3(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
+pub fn scatter_ssse3(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
     debug_assert_eq!(row_len, src.len());
     // SAFETY: the selected backend guarantees SSSE3.
     unsafe { scatter_ssse3_impl(rows, row_len, coeffs, src) }
@@ -1522,16 +1522,12 @@ unsafe fn scatter_ssse3_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], s
 
 /// Many sources into many rows using AVX2 nibble shuffles.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn matrix_avx2(
-    rows: &mut [u8],
-    row_len: usize,
-    nrows: usize,
-    terms: &[(&[Elem], &[u8])],
-) {
+pub fn matrix_avx2(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
     matrix_avx2_with(rows, row_len, nrows, terms);
 }
 
-pub(crate) fn matrix_avx2_with<M: Matrix<Elem> + ?Sized>(
+/// Many sources into many rows, AVX2 backend, over a generic matrix source.
+pub fn matrix_avx2_with<M: Matrix<Elem> + ?Sized>(
     rows: &mut [u8],
     row_len: usize,
     nrows: usize,
@@ -1619,16 +1615,12 @@ unsafe fn matrix_avx2_impl<M: Matrix<Elem> + ?Sized>(
 
 /// Many sources into many rows using SSSE3 nibble shuffles.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn matrix_ssse3(
-    rows: &mut [u8],
-    row_len: usize,
-    nrows: usize,
-    terms: &[(&[Elem], &[u8])],
-) {
+pub fn matrix_ssse3(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
     matrix_ssse3_with(rows, row_len, nrows, terms);
 }
 
-pub(crate) fn matrix_ssse3_with<M: Matrix<Elem> + ?Sized>(
+/// Many sources into many rows, SSSE3 backend, over a generic matrix source.
+pub fn matrix_ssse3_with<M: Matrix<Elem> + ?Sized>(
     rows: &mut [u8],
     row_len: usize,
     nrows: usize,

@@ -6,12 +6,9 @@ rust-version = "1.89"
 description = "Faster Finite Fields: SIMD and portable binary tower arithmetic and vector kernels"
 license = "MIT"
 repository = "https://github.com/nanithefkuc/fff"
-documentation = "https://docs.rs/fff"
 readme = "README.md"
 homepage = "https://github.com/nanithefkuc/fff"
-keywords = ["galois", "finite-field", "simd", "gf256", "erasure"]
-categories = ["algorithms", "mathematics", "no-std"]
-exclude = ["/external-bench", "/.github"]
+publish = false
 
 [features]
 default = ["std", "simd"]
@@ -21,15 +18,15 @@ std = []
 # Runtime-dispatched SIMD kernels (AVX-512/GFNI/AVX2/SSSE3 on x86, NEON
 # and optional PMULL on AArch64, and `simd128` on Wasm).
 simd = ["std"]
+# Expose the crate's internal kernel modules and preparation types for
+# downstream libraries that build directly on the kernels. This is not a
+# stable semver surface; it is for development of dependent libraries.
+internals = []
 
 [dependencies]
 
 [dev-dependencies]
 reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
-
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
 
 [profile.bench]
 lto = "thin"

@@ -62,7 +62,7 @@ fn scaled(value: v128, factors: Factors) -> v128 {
 }
 
 /// `dst ^= coeff * src` over interleaved tower elements.
-pub(crate) fn mul_add_simd128(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
+pub fn mul_add_simd128(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the binary requires `simd128`, and slices are independently borrowed.
     unsafe { mul_add_impl(dst, tables, src) }
@@ -87,7 +87,7 @@ unsafe fn mul_add_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
 }
 
 /// `dst = coeff * dst` over interleaved tower elements.
-pub(crate) fn mul_assign_simd128(dst: &mut [u8], tables: &TowerTables) {
+pub fn mul_assign_simd128(dst: &mut [u8], tables: &TowerTables) {
     // SAFETY: the binary requires `simd128`.
     unsafe { mul_assign_impl(dst, tables) }
 }
@@ -110,7 +110,7 @@ unsafe fn mul_assign_impl(dst: &mut [u8], tables: &TowerTables) {
 }
 
 /// `dst[i] = a[i] * b[i]` over interleaved tower elements.
-pub(crate) fn elementwise_simd128(dst: &mut [u8], a: &[u8], b: &[u8]) {
+pub fn elementwise_simd128(dst: &mut [u8], a: &[u8], b: &[u8]) {
     debug_assert_eq!(dst.len(), a.len());
     debug_assert_eq!(dst.len(), b.len());
     // SAFETY: the binary requires `simd128`, and all geometry was validated.
@@ -145,26 +145,21 @@ unsafe fn elementwise_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
 }
 
 /// One source into many rows using SIMD tower products.
-pub(crate) fn scatter_simd128(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
+pub fn scatter_simd128(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
     for (row, &coeff) in rows.chunks_exact_mut(row_len).zip(coeffs) {
         mul_add_simd128(row, &TowerTables::new(coeff), src);
     }
 }
 
 /// Many sources into one destination using SIMD tower products.
-pub(crate) fn gather_simd128(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
+pub fn gather_simd128(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     for (&coeff, src) in coeffs.iter().zip(srcs) {
         mul_add_simd128(dst, &TowerTables::new(coeff), src);
     }
 }
 
 /// Many sources into many rows using the SIMD single-row primitive.
-pub(crate) fn matrix_simd128(
-    rows: &mut [u8],
-    row_len: usize,
-    nrows: usize,
-    terms: &[(&[Elem], &[u8])],
-) {
+pub fn matrix_simd128(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
     for &(coeffs, src) in terms {
         for (row, &coeff) in rows[..nrows * row_len]
             .chunks_exact_mut(row_len)

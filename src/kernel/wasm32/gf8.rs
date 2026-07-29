@@ -35,7 +35,7 @@ fn scaled(value: v128, factors: Factors) -> v128 {
 }
 
 /// `dst ^= coeff * src` over 16-byte SIMD lanes.
-pub(crate) fn mul_add_simd128(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+pub fn mul_add_simd128(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the binary requires `simd128`, and slices are independently borrowed.
     unsafe { mul_add_impl(dst, table, src) }
@@ -60,7 +60,7 @@ unsafe fn mul_add_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
 }
 
 /// `dst = coeff * dst` over 16-byte SIMD lanes.
-pub(crate) fn mul_assign_simd128(dst: &mut [u8], table: &ScaleTable) {
+pub fn mul_assign_simd128(dst: &mut [u8], table: &ScaleTable) {
     // SAFETY: the binary requires `simd128`.
     unsafe { mul_assign_impl(dst, table) }
 }
@@ -85,7 +85,7 @@ unsafe fn mul_assign_impl(dst: &mut [u8], table: &ScaleTable) {
 /// `dst = coeff * src`, out of place, over 16-byte SIMD lanes.
 ///
 /// Fuses what would otherwise be a copy then an in-place scale: one pass, no `dst` read.
-pub(crate) fn mul_into_simd128(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+pub fn mul_into_simd128(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the binary requires `simd128`, and slices are independently borrowed.
     unsafe { mul_into_impl(dst, table, src) }
@@ -126,7 +126,7 @@ pub(super) fn multiply_vectors(mut a: v128, mut b: v128) -> v128 {
 }
 
 /// `dst[i] = a[i] * b[i]` over 16-byte SIMD lanes.
-pub(crate) fn elementwise_simd128(dst: &mut [u8], a: &[u8], b: &[u8]) {
+pub fn elementwise_simd128(dst: &mut [u8], a: &[u8], b: &[u8]) {
     debug_assert_eq!(dst.len(), a.len());
     debug_assert_eq!(dst.len(), b.len());
     // SAFETY: the binary requires `simd128`, and all geometry was validated.

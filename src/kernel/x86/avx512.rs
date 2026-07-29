@@ -17,7 +17,7 @@ const LANE: usize = 64;
 const TILE_VECTORS: usize = 8;
 
 /// `dst ^= src` over 64-byte AVX-512 lanes.
-pub(crate) fn xor(dst: &mut [u8], src: &[u8]) {
+pub fn xor(dst: &mut [u8], src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: dispatch established AVX-512F and the slices are independently
     // borrowed.
@@ -80,7 +80,7 @@ fn scale16(value: __m512i, swap: __m512i, same: __m512i, cross: __m512i) -> __m5
 }
 
 /// `dst ^= coeff * src` over 64 byte-wide GFNI lanes.
-pub(crate) fn gf8_mul_add(dst: &mut [u8], coeff: gf8::Elem, src: &[u8]) {
+pub fn gf8_mul_add(dst: &mut [u8], coeff: gf8::Elem, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: dispatch established AVX-512F, AVX-512BW, and GFNI.
     unsafe { gf8_mul_add_impl(dst, coeff, src) }
@@ -108,7 +108,7 @@ unsafe fn gf8_mul_add_impl(dst: &mut [u8], coeff: gf8::Elem, src: &[u8]) {
 }
 
 /// `dst = coeff * dst` over 64 byte-wide GFNI lanes.
-pub(crate) fn gf8_mul_assign(dst: &mut [u8], coeff: gf8::Elem) {
+pub fn gf8_mul_assign(dst: &mut [u8], coeff: gf8::Elem) {
     // SAFETY: dispatch established AVX-512F, AVX-512BW, and GFNI.
     unsafe { gf8_mul_assign_impl(dst, coeff) }
 }
@@ -133,7 +133,7 @@ unsafe fn gf8_mul_assign_impl(dst: &mut [u8], coeff: gf8::Elem) {
 /// `dst = coeff * src` over 64 byte-wide GFNI lanes, out of place.
 ///
 /// Fused form of copy-then-scale: one pass, `dst` is never read.
-pub(crate) fn gf8_mul_into(dst: &mut [u8], coeff: gf8::Elem, src: &[u8]) {
+pub fn gf8_mul_into(dst: &mut [u8], coeff: gf8::Elem, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: dispatch established AVX-512F, AVX-512BW, and GFNI.
     unsafe { gf8_mul_into_impl(dst, coeff, src) }
@@ -157,7 +157,7 @@ unsafe fn gf8_mul_into_impl(dst: &mut [u8], coeff: gf8::Elem, src: &[u8]) {
 }
 
 /// `dst[i] = a[i] * b[i]` over 64 byte-wide GFNI lanes.
-pub(crate) fn gf8_elementwise(dst: &mut [u8], a: &[u8], b: &[u8]) {
+pub fn gf8_elementwise(dst: &mut [u8], a: &[u8], b: &[u8]) {
     debug_assert_eq!(dst.len(), a.len());
     debug_assert_eq!(dst.len(), b.len());
     // SAFETY: dispatch established AVX-512F, AVX-512BW, and GFNI.
@@ -182,7 +182,7 @@ unsafe fn gf8_elementwise_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
 }
 
 /// `dst ^= coeff * src` over 64-byte tower-field lanes.
-pub(crate) fn gf16_mul_add(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
+pub fn gf16_mul_add(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: dispatch established AVX-512F, AVX-512BW, and GFNI.
     unsafe { gf16_mul_add_impl(dst, coeff, src) }
@@ -211,7 +211,7 @@ unsafe fn gf16_mul_add_impl(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
 }
 
 /// `dst = coeff * dst` over 64-byte tower-field lanes.
-pub(crate) fn gf16_mul_assign(dst: &mut [u8], coeff: TowerCoeff) {
+pub fn gf16_mul_assign(dst: &mut [u8], coeff: TowerCoeff) {
     // SAFETY: dispatch established AVX-512F, AVX-512BW, and GFNI.
     unsafe { gf16_mul_assign_impl(dst, coeff) }
 }
@@ -237,7 +237,7 @@ unsafe fn gf16_mul_assign_impl(dst: &mut [u8], coeff: TowerCoeff) {
 /// `dst = coeff * src` over 64-byte tower-field lanes, out of place.
 ///
 /// Fused form of copy-then-scale: one pass, `dst` is never read.
-pub(crate) fn gf16_mul_into(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
+pub fn gf16_mul_into(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: dispatch established AVX-512F, AVX-512BW, and GFNI.
     unsafe { gf16_mul_into_impl(dst, coeff, src) }
@@ -262,7 +262,7 @@ unsafe fn gf16_mul_into_impl(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
 }
 
 /// `dst[i] = a[i] * b[i]` over interleaved tower elements.
-pub(crate) fn gf16_elementwise(dst: &mut [u8], a: &[u8], b: &[u8]) {
+pub fn gf16_elementwise(dst: &mut [u8], a: &[u8], b: &[u8]) {
     debug_assert_eq!(dst.len(), a.len());
     debug_assert_eq!(dst.len(), b.len());
     // SAFETY: dispatch established AVX-512F, AVX-512BW, and GFNI.
@@ -300,7 +300,7 @@ unsafe fn gf16_elementwise_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
 }
 
 /// One GF(2^8) source into many rows, sharing each load across eight rows.
-pub(crate) fn gf8_scatter(rows: &mut [u8], row_len: usize, coeffs: &[gf8::Elem], src: &[u8]) {
+pub fn gf8_scatter(rows: &mut [u8], row_len: usize, coeffs: &[gf8::Elem], src: &[u8]) {
     debug_assert_eq!(rows.len(), row_len * coeffs.len());
     debug_assert_eq!(src.len(), row_len);
     // SAFETY: dispatch established the features and rows are disjoint by construction.
@@ -371,7 +371,7 @@ unsafe fn gf8_scatter_group<const N: usize>(
 }
 
 /// Many GF(2^8) sources into one destination, blocked over 512-byte tiles.
-pub(crate) fn gf8_gather(dst: &mut [u8], coeffs: &[gf8::Elem], srcs: &[&[u8]]) {
+pub fn gf8_gather(dst: &mut [u8], coeffs: &[gf8::Elem], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
     // SAFETY: dispatch established AVX-512F, AVX-512BW, and GFNI.
     unsafe { gf8_gather_impl(dst, coeffs, srcs) }
@@ -407,12 +407,7 @@ unsafe fn gf8_gather_impl(dst: &mut [u8], coeffs: &[gf8::Elem], srcs: &[&[u8]]) 
 }
 
 /// Many sources into many GF(2^8) rows, eight rows by 128 bytes per tile.
-pub(crate) fn gf8_matrix(
-    rows: &mut [u8],
-    row_len: usize,
-    nrows: usize,
-    terms: &[(&[gf8::Elem], &[u8])],
-) {
+pub fn gf8_matrix(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[gf8::Elem], &[u8])]) {
     // SAFETY: public wrappers validated all geometry and dispatch established the features.
     unsafe { gf8_matrix_impl(rows, row_len, nrows, terms) }
 }
@@ -482,7 +477,7 @@ unsafe fn gf8_matrix_group<const N: usize>(
 }
 
 /// One tower-field source into many rows, sharing each load across eight rows.
-pub(crate) fn gf16_scatter(rows: &mut [u8], row_len: usize, coeffs: &[gf16::Elem], src: &[u8]) {
+pub fn gf16_scatter(rows: &mut [u8], row_len: usize, coeffs: &[gf16::Elem], src: &[u8]) {
     debug_assert_eq!(rows.len(), row_len * coeffs.len());
     debug_assert_eq!(src.len(), row_len);
     // SAFETY: dispatch established the features and rows are disjoint by construction.
@@ -557,7 +552,7 @@ unsafe fn gf16_scatter_group<const N: usize>(
 }
 
 /// Many tower-field sources into one destination, blocked over 512-byte tiles.
-pub(crate) fn gf16_gather(dst: &mut [u8], coeffs: &[gf16::Elem], srcs: &[&[u8]]) {
+pub fn gf16_gather(dst: &mut [u8], coeffs: &[gf16::Elem], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
     // SAFETY: dispatch established AVX-512F, AVX-512BW, and GFNI.
     unsafe { gf16_gather_impl(dst, coeffs, srcs) }
@@ -594,7 +589,7 @@ unsafe fn gf16_gather_impl(dst: &mut [u8], coeffs: &[gf16::Elem], srcs: &[&[u8]]
 }
 
 /// Many sources into many tower-field rows, eight rows by 128 bytes per tile.
-pub(crate) fn gf16_matrix(
+pub fn gf16_matrix(
     rows: &mut [u8],
     row_len: usize,
     nrows: usize,
