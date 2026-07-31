@@ -445,8 +445,10 @@ pub trait FieldKernels: Field + private::Sealed {
     ///
     /// The default copies `src` into `dst` and scales in place — two passes
     /// over the destination. Backends with a fused single-pass kernel
-    /// override this; the override is worth roughly 2x on large buffers
-    /// because it halves destination memory traffic.
+    /// override this. The override is worth roughly 2x on large buffers where
+    /// the kernel is bandwidth-bound (x86 GF(2^8)/GF(2^16)); where it is
+    /// compute-bound instead, as GF(2^16) is on NEON and wasm, halving
+    /// destination traffic buys only a few percent (BENCHMARKS.md).
     fn mul_into(dst: &mut [u8], coeff: &Self::Prepared, src: &[u8]) {
         dst.copy_from_slice(src);
         Self::mul_assign(dst, coeff);

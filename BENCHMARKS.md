@@ -19,6 +19,47 @@ FFF_BACKEND=ssse3 cargo bench --bench kernels
 FFF_BACKEND=scalar cargo bench --bench kernels
 ```
 
+Non-x86 targets need a runner. The `aarch64` and `wasm32` kernels were
+measured with these:
+
+```sh
+# aarch64, on an adb-connected arm64 device (cargo-ndk):
+cargo ndk -t arm64-v8a build --release --bench kernels
+adb push target/aarch64-linux-android/release/deps/kernels-<hash> /data/local/tmp/
+adb shell 'cd /data/local/tmp && taskset 80 ./kernels-<hash>'
+
+# wasm32, under Node's WASI shim:
+RUSTFLAGS="-C target-feature=+simd128" \
+  cargo build --release --target wasm32-wasip1 --bench kernels
+node wasi-run.mjs target/wasm32-wasip1/release/deps/kernels-<hash>.wasm
+```
+
+`wasi-run.mjs` is the whole shim (the same one works as
+`CARGO_TARGET_WASM32_WASIP1_RUNNER` for `cargo test --target wasm32-wasip1`):
+
+```js
+import { WASI } from "node:wasi";
+import { argv, env, exit } from "node:process";
+import { readFile } from "node:fs/promises";
+
+const [wasmPath, ...rest] = argv.slice(2);
+const wasi = new WASI({ version: "preview1", args: [wasmPath, ...rest], env,
+                        preopens: { "/": "/" }, returnOnExit: true });
+const module = await WebAssembly.compile(await readFile(wasmPath));
+exit(wasi.start(await WebAssembly.instantiate(module, wasi.getImportObject())));
+```
+
+Both runners are far noisier than a pinned desktop CPU, so a single pair of
+runs proves nothing:
+
+- On a phone, `taskset` to **one** big core, not the cluster: migration
+  between cores produces a bimodal distribution (two clean clusters ~1.5x
+  apart), and a whole run can land in either mode.
+- Under Node, tiering and GC shift results by up to 40% run to run.
+- Interleave the two binaries (`base, new, base, new, …`), take the **maximum**
+  of at least three runs per key, and always include an unchanged operation as
+  a control. Every number below was accepted only with its control at 1.00x.
+
 Record the CPU, operating system, Rust version, selected backend, row size, row
 count, and source count with any quoted result. `backend_for::<F>()` matters
 for the wider towers and Fan–Paar family: GF(2^32)/GF(2^64) use GFNI on
@@ -58,6 +99,45 @@ against repeated single-row AXPY by calling both directly, bypassing dispatch.
 It needs the `internals` feature (`cargo bench --bench kernels --features
 internals`) and is the harness to rerun before changing which shape a backend
 dispatches to.
+
+`bench_small_row_shapes` measures the GF(2^16) multi-row shapes at row lengths
+where a coefficient's four nibble tables are still a visible share of the work,
+with a coefficient set that is one-fifth zeros and one-fifth ones so the
+zero/one specializations are exercised. It also times fused `mul_into` against
+the copy-then-scale it replaces.
+
+## aarch64 and wasm32 kernel numbers (2026-07-31)
+
+Snapdragon 8 Gen 3 (`arm64-v8a`, Android, rustc 1.93, backend `neon`), one big
+core, maximum of four interleaved runs, GF(2^8) buffers as control (1.00x):
+
+| Shape | Before | After |
+| --- | --- | --- |
+| gf16 `mul_add`, 4 KiB … 8 MiB | 2.09–2.17 GiB/s | 2.30–2.41 GiB/s (+11%) |
+| gf16 `mul_assign`, ≤ 256 KiB | 2.30–2.35 GiB/s | 2.39–2.45 GiB/s (+4%) |
+| gf16 `mul_into`, 16 KiB rows | copy-then-scale | fused, +6% over copy+scale |
+
+The gf16 two-lane unroll is what moves `mul_add`; it wins at every size from
+4 KiB to 8 MiB on a pinned core. Measured on the *cluster* instead, the same
+binary reports anything from 0.65x to 1.11x — that spread is core migration,
+not the kernel.
+
+Node 26 WASI (`wasm32-wasip1`, `simd128`, rustc 1.93), maximum of four
+interleaved runs, GF(2^8) `xor`/`elementwise` as control (1.00x):
+
+| Shape | Before | After |
+| --- | --- | --- |
+| gf16 `mul_add`, 4 KiB … 8 MiB | 4.5–5.4 GiB/s | 5.6–6.1 GiB/s (+13–24%) |
+| gf16 `mul_assign`, 4 KiB … 8 MiB | 5.0–5.2 GiB/s | 6.0–6.2 GiB/s (+14–25%) |
+| gf16 `scatter`, 16 rows, ≥ 256 B | 4.4–5.1 GiB/s | 9.8–11.1 GiB/s (~2.1x) |
+| gf16 `gather`, 8 sources, ≥ 256 B | 4.5–5.4 GiB/s | 7.5–9.1 GiB/s (~1.7x) |
+| gf16 `matrix`, 16x8, ≥ 256 B | 4.8–5.0 GiB/s | 6.2–7.9 GiB/s (1.3–1.6x) |
+
+The multi-row factors come from hoisting the four-table derivation out of the
+per-`(term, row)` loop and skipping zero/one coefficients; at 64 B rows the
+result is inside Node's noise band. A two-lane unroll of the *GF(2^8)* wasm
+kernels measured 1.00x and was therefore not kept: two swizzles per lane leave
+no latency to hide, unlike GF(2^16)'s eight.
 
 ## Comparative benchmark
 

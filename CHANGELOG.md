@@ -12,6 +12,30 @@ All notable changes to this project are documented here. The format follows
   distributed through git only.
 
 ### Added
+- Fused GF(2^16) `mul_into` for NEON and wasm `simd128`; both backends used the
+  default copy-then-scale before. Both fields' GF(2^16) kernels are
+  compute-bound on those targets, so halving destination traffic is worth a few
+  percent, not the ~2x it buys on bandwidth-bound x86.
+- Two-lane (32-byte) blocks in the NEON and wasm `simd128` GF(2^16)
+  `mul_add`/`mul_assign`/`mul_into` kernels: eight table lookups per lane leave
+  enough latency to hide a second lane's loads and nibble splits. +11% at
+  4 KiB … 8 MiB on a pinned Snapdragon 8 Gen 3 core; +13–25% under Node/V8.
+  The same unroll measured 1.00x for the GF(2^8) wasm kernels and was not
+  taken; the reason is recorded in the code.
+- wasm `simd128` GF(2^16) `scatter`/`gather`/`matrix` are real kernels instead
+  of per-row `mul_add` loops that rebuilt a coefficient's four nibble tables
+  once per `(term, row)`: preparation is hoisted to one resolve per coefficient
+  per call, zero and one coefficients skip it entirely, `gather` keeps a
+  32-byte destination tile in registers across a block of eight sources, and
+  `matrix` keeps a four-row tile across a block of eight terms. Rows ≥ 256 B:
+  scatter ~2.1x, gather ~1.7x, matrix 1.3–1.6x under Node/V8.
+- `bench_small_row_shapes` in `benches/kernels.rs`: GF(2^16) multi-row shapes at
+  preparation-dominated row lengths, plus fused `mul_into` against
+  copy-then-scale. `BENCHMARKS.md` documents the aarch64 (adb/cargo-ndk) and
+  wasm32 (Node WASI) runner recipes and the variance rules those hosts need.
+- Differential coverage for `mul_into` on every backend that implements it
+  (`check_gf8_mul_into`, `check_gf16_mul_into_tables`); the shape had no direct
+  kernel test before.
 - `mul_elementwise` vector kernels for the shuffle-only x86 backends
   (AVX2, SSSE3) for GF(2^8) and GF(2^16). With both operands varying there is
   no nibble table to build, so the base-field product is the eight-round

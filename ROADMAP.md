@@ -10,8 +10,10 @@ as part of the current contract.
 - Run the AVX-512 differential suite on AVX-512F + AVX-512BW + GFNI silicon.
   The backend cross-compiles and its emitted assembly has been inspected, but
   the current development host cannot execute it.
-- Run the optional AArch64 PMULL path on an AES/PMULL-capable CI runner.
-  Baseline NEON has been exercised on Snapdragon 8 Gen 3 hardware.
+- The optional AArch64 PMULL path is exercised on Snapdragon 8 Gen 3 hardware,
+  as is baseline NEON: `cargo ndk-test -t arm64-v8a` against an adb-connected
+  arm64 device runs the differential and public suites. An AES/PMULL-capable CI
+  runner would keep that coverage without a device attached.
 - Add fuzz targets for public row geometry (`row_len`, `nrows`, source count,
   coefficient count) and packed element boundaries.
 - Keep scalar/no-default-feature paths under Miri. Intrinsics themselves are

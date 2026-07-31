@@ -625,7 +625,7 @@ unsafe fn gather_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
 
 /// Lane-parallel GF(2^8) multiplication for two varying byte vectors.
 ///
-/// `PMULL` is in AArch64's optional crypto extension, not baseline NEON, so
+/// `PMULL` is in `AArch64`'s optional crypto extension, not baseline NEON, so
 /// the portable NEON backend uses eight branchless shift/reduce rounds. Every
 /// round processes all 16 lanes and the scalar tail is shorter than one lane.
 #[inline]
@@ -676,7 +676,7 @@ pub(super) fn multiply_vectors_pmull(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t
     )
 }
 
-/// `dst[i] = a[i] * b[i]` using the optional AArch64 crypto extension.
+/// `dst[i] = a[i] * b[i]` using the optional `AArch64` crypto extension.
 pub fn elementwise_pmull(dst: &mut [u8], a: &[u8], b: &[u8]) {
     debug_assert_eq!(dst.len(), a.len());
     debug_assert_eq!(dst.len(), b.len());

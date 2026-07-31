@@ -292,8 +292,12 @@ impl FieldKernels for Gf16 {
                 Backend::Ssse3 => x86::gf16::mul_into_ssse3(dst, tables, src),
                 _ => x86::gf16::mul_into_avx2(dst, tables, src),
             },
-            // aarch64 and wasm32 keep the default copy-then-scale until their
-            // GF(2^16) fused kernels are written.
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            Prepared::Tables(tables) => aarch64::gf16::mul_into_neon(dst, tables, src),
+            #[cfg(all(feature = "simd", target_arch = "wasm32"))]
+            Prepared::Tables(tables) => wasm32::gf16::mul_into_simd128(dst, tables, src),
+            // Every other prepared form is a scalar coefficient: copying and
+            // scaling in place is one pass either way.
             other => {
                 dst.copy_from_slice(src);
                 Self::mul_assign(dst, other);

@@ -284,11 +284,89 @@ fn bench_blocked_vs_axpy() {
     println!();
 }
 
+/// Row lengths where a GF(2^16) coefficient's four nibble tables are a
+/// visible share of the work, plus one length where they are not.
+const SMALL_ROW_LENGTHS: &[usize] = &[64, 256, 1_024, 16_384];
+
+/// Multi-row GF(2^16) shapes at row lengths where preparation dominates.
+///
+/// A GF(2^16) coefficient costs four derived nibble tables. Multi-row kernels
+/// that rebuild them per `(term, row)` — as the wasm kernels used to — pay
+/// that per row instead of once, which only shows up when the row is short
+/// enough that the byte loop cannot hide it. Coefficient sets deliberately
+/// include zeros and ones, the case the zero/one specializations exist for.
+fn bench_small_row_shapes() {
+    println!("small-row GF(2^16) multi-row shapes — preparation-dominated:");
+    let nrows = 16;
+    let nsrc = 8;
+    for &row_len in SMALL_ROW_LENGTHS {
+        let sources: Vec<Vec<u8>> = (0..nsrc)
+            .map(|t| noise(row_len, 0xf00 + t as u64))
+            .collect();
+        let srcs: Vec<&[u8]> = sources.iter().map(Vec::as_slice).collect();
+        // Every fourth coefficient is zero and every fifth is one.
+        let coeff_at = |i: usize| match i % 5 {
+            0 => gf16::Elem::ZERO,
+            1 => gf16::Elem::ONE,
+            _ => gf16::Elem(((i * 7919) as u16) | 0x0100),
+        };
+        let row_coeffs: Vec<gf16::Elem> = (0..nrows).map(coeff_at).collect();
+        let coeff_sets: Vec<Vec<gf16::Elem>> = (0..nsrc)
+            .map(|t| (0..nrows).map(|j| coeff_at(t * 3 + j)).collect())
+            .collect();
+        let terms: Vec<(&[gf16::Elem], &[u8])> = coeff_sets
+            .iter()
+            .zip(&sources)
+            .map(|(c, s)| (c.as_slice(), s.as_slice()))
+            .collect();
+        let mut rows = noise(row_len * nrows, 0x1000);
+        let mut dst = noise(row_len, 0x1100);
+
+        println!("  row {row_len} B, {nrows} rows, {nsrc} sources:");
+        bench("  scatter                   gf16", row_len * nrows, || {
+            ops::mul_add_scatter::<Gf16>(
+                black_box(&mut rows),
+                row_len,
+                &row_coeffs,
+                black_box(srcs[0]),
+            );
+        });
+        bench("  gather                    gf16", row_len * nsrc, || {
+            ops::mul_add_gather::<Gf16>(black_box(&mut dst), &row_coeffs[..nsrc], black_box(&srcs));
+        });
+        bench(
+            "  matrix                    gf16",
+            row_len * nrows * nsrc,
+            || {
+                ops::mul_add_matrix::<Gf16>(black_box(&mut rows), row_len, nrows, &terms);
+            },
+        );
+
+        // Fused `mul_into` against the copy-then-scale it replaces: the
+        // fused kernel touches the destination once.
+        let coeff = gf16::Elem(0x53a7);
+        let fused = bench("  mul_into fused            gf16", row_len, || {
+            ops::mul_into::<Gf16>(black_box(&mut dst), coeff, black_box(srcs[0]));
+        });
+        let copied = bench("  mul_into copy+scale       gf16", row_len, || {
+            let dst = black_box(&mut dst);
+            dst.copy_from_slice(black_box(srcs[0]));
+            ops::mul_assign::<Gf16>(dst, coeff);
+        });
+        println!(
+            "    copy+scale/fused: {:.2}x",
+            copied.as_secs_f64() / fused.as_secs_f64()
+        );
+    }
+    println!();
+}
+
 fn main() {
     println!("fff kernel benchmark — backend: {}", backend().name());
     println!("  (override with FFF_BACKEND=avx512|gfni|avx2|ssse3|neon|scalar)\n");
 
     bench_preparation_crossover();
+    bench_small_row_shapes();
     #[cfg(all(
         feature = "internals",
         any(target_arch = "x86", target_arch = "x86_64")

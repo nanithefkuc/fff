@@ -132,6 +132,34 @@ fn check_gf16_mul_assign_tables(name: &str, kernel: impl Fn(&mut [u8], &TowerTab
     }
 }
 
+fn check_gf8_mul_into(name: &str, kernel: impl Fn(&mut [u8], &ScaleTable, &[u8])) {
+    for &len in LENGTHS {
+        let src = noise(len, 0x136);
+        for coeff in gf8_coeffs() {
+            // Pre-fill the destination with noise: a fused kernel must
+            // overwrite it, never accumulate into it.
+            let mut got = noise(len, 0x147);
+            let mut want = src.clone();
+            kernel(&mut got, scale_table(coeff), &src);
+            scalar::mul_assign::<gf8::Gf8>(&mut want, coeff);
+            assert_eq!(got, want, "{name}: len {len}, coeff {coeff:?}");
+        }
+    }
+}
+
+fn check_gf16_mul_into_tables(name: &str, kernel: impl Fn(&mut [u8], &TowerTables, &[u8])) {
+    for &len in LENGTHS {
+        let src = noise(len, 0x158);
+        for coeff in gf16_coeffs() {
+            let mut got = noise(len, 0x169);
+            let mut want = src.clone();
+            kernel(&mut got, &TowerTables::new(coeff), &src);
+            scalar::mul_assign::<gf16::Gf16>(&mut want, coeff);
+            assert_eq!(got, want, "{name}: len {len}, coeff {coeff:?}");
+        }
+    }
+}
+
 /// Compare a scatter kernel against a per-row reference AXPY.
 fn check_scatter<E: Copy, F>(
     name: &str,
@@ -798,6 +826,8 @@ mod x86 {
         check_gf8_mul_assign("gf8 avx2", x86::gf8::mul_assign_avx2);
         check_gf16_mul_add_tables("gf16 avx2", x86::gf16::mul_add_avx2);
         check_gf16_mul_assign_tables("gf16 avx2", x86::gf16::mul_assign_avx2);
+        check_gf8_mul_into("gf8 avx2 mul_into", x86::gf8::mul_into_avx2);
+        check_gf16_mul_into_tables("gf16 avx2 mul_into", x86::gf16::mul_into_avx2);
         check_scatter(
             "gf8 avx2 scatter",
             gf8_coeff_at,
@@ -938,6 +968,8 @@ mod x86 {
         check_gf8_mul_assign("gf8 ssse3", x86::gf8::mul_assign_ssse3);
         check_gf16_mul_add_tables("gf16 ssse3", x86::gf16::mul_add_ssse3);
         check_gf16_mul_assign_tables("gf16 ssse3", x86::gf16::mul_assign_ssse3);
+        check_gf8_mul_into("gf8 ssse3 mul_into", x86::gf8::mul_into_ssse3);
+        check_gf16_mul_into_tables("gf16 ssse3 mul_into", x86::gf16::mul_into_ssse3);
         check_scatter(
             "gf8 ssse3 scatter",
             gf8_coeff_at,
@@ -1042,6 +1074,8 @@ mod aarch64 {
         check_gf8_mul_assign("gf8 neon", aarch64::gf8::mul_assign_neon);
         check_gf16_mul_add_tables("gf16 neon", aarch64::gf16::mul_add_neon);
         check_gf16_mul_assign_tables("gf16 neon", aarch64::gf16::mul_assign_neon);
+        check_gf8_mul_into("gf8 neon mul_into", aarch64::gf8::mul_into_neon);
+        check_gf16_mul_into_tables("gf16 neon mul_into", aarch64::gf16::mul_into_neon);
 
         check_scatter(
             "gf8 neon scatter",
@@ -1121,6 +1155,8 @@ mod wasm32 {
         check_gf8_mul_assign("gf8 simd128", wasm32::gf8::mul_assign_simd128);
         check_gf16_mul_add_tables("gf16 simd128", wasm32::gf16::mul_add_simd128);
         check_gf16_mul_assign_tables("gf16 simd128", wasm32::gf16::mul_assign_simd128);
+        check_gf8_mul_into("gf8 simd128 mul_into", wasm32::gf8::mul_into_simd128);
+        check_gf16_mul_into_tables("gf16 simd128 mul_into", wasm32::gf16::mul_into_simd128);
         check_scatter(
             "gf8 simd128 scatter",
             gf8_coeff_at,

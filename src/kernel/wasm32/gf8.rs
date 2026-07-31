@@ -36,6 +36,11 @@ fn scaled(value: v128, factors: Factors) -> v128 {
 }
 
 /// `dst ^= coeff * src` over 16-byte SIMD lanes.
+///
+/// Deliberately one lane per iteration. A two-lane unroll — the shape that is
+/// worth +11% for the GF(2^16) kernels on the same runtime — measured 1.00x
+/// here under Node/V8 at 4 KiB, 256 KiB and 8 MiB: two swizzles per lane is
+/// too little work to have any latency left to hide.
 pub fn mul_add_simd128(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the binary requires `simd128`, and slices are independently borrowed.
