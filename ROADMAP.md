@@ -25,10 +25,10 @@ implementation.
 
 - Revisit the measured crossover rules per `(field, backend, shape)`. A backend
   name alone cannot predict whether a particular operation is register-blocked.
-- Investigate vector implementations for `Gf32`, `Gf64`, and the canonical
-  Fan–Paar tower only when a representation-specific design beats the portable
-  reference. A generic intrinsic layer without a field that benefits is dead
-  code.
+- GF(2^32)/GF(2^64) now have an x86 GFNI kernel (the tower identity one and two
+  levels above GF(2^16)); the remaining vectorization work is the shuffle
+  (AVX2/SSSE3) and NEON/wasm arms of the same identity, and the canonical
+  Fan–Paar tower, which still uses the portable reference.
 
 ## Deliberate non-goals
 

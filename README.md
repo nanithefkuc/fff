@@ -7,7 +7,8 @@ it is deliberately not a codec.
 
 - Stable little-endian byte encodings.
 - Portable `no_std` scalar implementation.
-- SIMD kernels for GF(2^8) and GF(2^16).
+- SIMD kernels for GF(2^8) and GF(2^16) on every SIMD backend; GF(2^32) and
+  GF(2^64) on x86 GFNI, with the same tower identity one and two levels up.
 - Const-callable scalar arithmetic on every concrete element type.
 - No dependencies in normal builds.
 
@@ -35,8 +36,8 @@ MSRV is Rust 1.89.
 | --- | --- | --- | --- | --- |
 | GF(2^8) | `Gf8` | `gf8::Elem` | AES polynomial `0x11B` | SIMD |
 | GF(2^16) | `Gf16` | `gf16::Elem` | quadratic tower over `Gf8` | SIMD |
-| GF(2^32) | `Gf32` | `gf32::Elem` | quadratic tower over `Gf16` | portable |
-| GF(2^64) | `Gf64` | `gf64::Elem` | quadratic tower over `Gf32` | portable |
+| GF(2^32) | `Gf32` | `gf32::Elem` | quadratic tower over `Gf16` | GFNI x86 |
+| GF(2^64) | `Gf64` | `gf64::Elem` | quadratic tower over `Gf32` | GFNI x86 |
 | Fan–Paar GF(2^8) | `FanPaar8` | `fan_paar::fp8::Elem` | canonical recursive tower | portable |
 | Fan–Paar GF(2^16) | `FanPaar16` | `fan_paar::fp16::Elem` | canonical recursive tower | portable |
 | Fan–Paar GF(2^32) | `FanPaar32` | `fan_paar::fp32::Elem` | canonical recursive tower | portable |
@@ -123,9 +124,10 @@ boundaries instead of writing chunk loops by hand.
 ## Backends
 
 `backend()` reports the process-wide SIMD selection. `backend_for::<F>()`
-reports what a particular field actually uses; wider and Fan–Paar fields
-currently report `scalar`. `has_vector_elementwise::<F>()` exposes the notable
-performance boundary of `mul_elementwise`.
+reports what a particular field actually uses; the GF(2^32)/GF(2^64) towers
+report the GFNI backend on x86 GFNI hosts and `scalar` elsewhere, and the
+Fan–Paar family reports `scalar`. `has_vector_elementwise::<F>()` exposes the
+notable performance boundary of `mul_elementwise`.
 
 | Identifier | Target and requirements | Lane width |
 | --- | --- | --- |

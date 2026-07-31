@@ -155,6 +155,54 @@ impl TowerTables {
     }
 }
 
+/// Period-2 alternating subfield coefficients for a two-level tower multiply.
+///
+/// Generalizes [`TowerCoeff`] one field level up. For a level-2 element
+/// `c = c0 + c1·u` over `u² + u + DELTA`, the level-2 multiply is
+///
+/// ```text
+/// c·x = lane_mul(x,      same)  ^  lane_mul(swap(x), cross)
+/// ```
+///
+/// where `lane_mul` multiplies subfield elements under alternating `same`/
+/// `cross` coefficients and `swap` exchanges the two subfield halves of each
+/// element. `same = [c0, c0 + c1]` applies to the source's even and odd
+/// subfield lanes; `cross = [DELTA·c1, c1]` to the half-swapped source. This
+/// is exactly the identity the GF(2^16) kernel builds at byte granularity
+/// via [`TowerCoeff`], one level up.
+///
+/// The form carries subfield elements, not byte broadcasts, so it is
+/// representation-agnostic: GF(2^32) builds it over `gf16::Elem` and GF(2^64)
+/// over `gf32::Elem`, each with its own `DELTA`.
+/// This is a representation-agnostic seam: every level-2 SIMD tower — the
+/// GFNI x86 path today, the aarch64/wasm paths to come — derives it from the
+/// subfield element, so it is dead weight only on targets with no such
+/// kernel.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tower2Coeff<E> {
+    /// `[c0, c0 + c1]`, applied to the even and odd subfield lanes of the
+    /// source.
+    pub same: [E; 2],
+    /// `[DELTA·c1, c1]`, applied to the even and odd lanes of the half-swapped
+    /// source.
+    pub cross: [E; 2],
+}
+
+impl<E: crate::field::Elem> Tower2Coeff<E> {
+    /// Derive the alternating subfield coefficient pair for `c0 + c1·u` over
+    /// `u² + u + delta`.
+    #[inline]
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn derive(c0: E, c1: E, delta: E) -> Self {
+        Self {
+            same: [c0, c0.add(c1)],
+            cross: [delta.mul(c1), c1],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

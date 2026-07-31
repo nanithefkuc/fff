@@ -20,9 +20,11 @@ FFF_BACKEND=scalar cargo bench --bench kernels
 ```
 
 Record the CPU, operating system, Rust version, selected backend, row size, row
-count, and source count with any quoted result. `backend_for::<F>()` matters for
-wider and Fan–Paar fields: they currently use the portable kernels even when
-the process-wide backend is `avx512` or `gfni`.
+count, and source count with any quoted result. `backend_for::<F>()` matters
+for the wider towers and Fan–Paar family: GF(2^32)/GF(2^64) now use GFNI on
+x86 GFNI hosts, but the Fan–Paar fields and every shuffle-only backend still
+report the portable kernels even when the process-wide backend is `avx512` or
+`gfni`.
 
 ## Interpreting the shapes
 

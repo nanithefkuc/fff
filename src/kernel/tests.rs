@@ -17,7 +17,7 @@ extern crate std;
 use std::vec;
 use std::vec::Vec;
 
-use crate::field::{gf8, gf16};
+use crate::field::{Gf32, Gf64, gf8, gf16, gf32, gf64};
 use crate::kernel::scalar;
 use crate::kernel::tables::{ScaleTable, TowerCoeff, TowerTables, scale_table};
 
@@ -248,6 +248,66 @@ fn check_gf16_elementwise(name: &str, kernel: impl Fn(&mut [u8], &[u8], &[u8])) 
     }
 }
 
+/// Compare a tower-field `mul_add` kernel against the portable reference at
+/// every length and coefficient.
+fn check_tower_mul_add<E: Copy + core::fmt::Debug>(
+    name: &str,
+    lengths: &[usize],
+    coeffs: &[E],
+    reference: impl Fn(&mut [u8], E, &[u8]),
+    kernel: impl Fn(&mut [u8], E, &[u8]),
+) {
+    for &len in lengths {
+        for (ci, &coeff) in coeffs.iter().enumerate() {
+            let src = noise(len, 0x90 ^ (ci as u64).wrapping_mul(7));
+            let mut want = noise(len, 0x80 ^ (ci as u64).wrapping_mul(13));
+            let mut got = want.clone();
+            reference(&mut want, coeff, &src);
+            kernel(&mut got, coeff, &src);
+            assert_eq!(got, want, "{name}: len {len} coeff {coeff:?}");
+        }
+    }
+}
+
+/// Compare a tower-field `mul_assign` kernel against the portable reference.
+fn check_tower_mul_assign<E: Copy + core::fmt::Debug>(
+    name: &str,
+    lengths: &[usize],
+    coeffs: &[E],
+    reference: impl Fn(&mut [u8], E),
+    kernel: impl Fn(&mut [u8], E),
+) {
+    for &len in lengths {
+        for (ci, &coeff) in coeffs.iter().enumerate() {
+            let mut want = noise(len, 0x80 ^ (ci as u64).wrapping_mul(13));
+            let mut got = want.clone();
+            reference(&mut want, coeff);
+            kernel(&mut got, coeff);
+            assert_eq!(got, want, "{name}: len {len} coeff {coeff:?}");
+        }
+    }
+}
+
+/// Compare a tower-field `mul_into` kernel against copy-then-scale.
+fn check_tower_mul_into<E: Copy + core::fmt::Debug>(
+    name: &str,
+    lengths: &[usize],
+    coeffs: &[E],
+    reference: impl Fn(&mut [u8], E, &[u8]),
+    kernel: impl Fn(&mut [u8], E, &[u8]),
+) {
+    for &len in lengths {
+        for (ci, &coeff) in coeffs.iter().enumerate() {
+            let src = noise(len, 0x90 ^ (ci as u64).wrapping_mul(7));
+            let mut want = vec![0; len];
+            let mut got = vec![0; len];
+            reference(&mut want, coeff, &src);
+            kernel(&mut got, coeff, &src);
+            assert_eq!(got, want, "{name}: len {len} coeff {coeff:?}");
+        }
+    }
+}
+
 fn gf8_coeff_at(j: usize) -> gf8::Elem {
     // Includes 0 and 1 as j sweeps, which is what we want: the blocked
     // kernels must handle degenerate coefficients per row, not per call.
@@ -272,6 +332,85 @@ fn gf8_reference(dst: &mut [u8], coeff: gf8::Elem, src: &[u8]) {
 
 fn gf16_reference(dst: &mut [u8], coeff: gf16::Elem, src: &[u8]) {
     scalar::mul_add::<gf16::Gf16>(dst, coeff, src);
+}
+
+/// GF(2^32) coefficients: the short-circuits, the extremes, pure tower
+/// components, the tower constant, the generator, and a deterministic spread.
+fn gf32_coeffs() -> Vec<gf32::Elem> {
+    let mut v = vec![
+        gf32::Elem::ZERO,
+        gf32::Elem::ONE,
+        gf32::Elem(u32::MAX),
+        gf32::Elem(0x0000_ffff),
+        gf32::Elem(0xffff_0000),
+        // Pure base field and pure extension.
+        gf32::Elem::from_components(gf16::Elem::ONE, gf16::Elem::ZERO),
+        gf32::Elem::from_components(gf16::Elem::ZERO, gf16::Elem::ONE),
+        // The tower constant in each component.
+        gf32::Elem::from_components(gf32::DELTA, gf16::Elem::ZERO),
+        gf32::Elem::from_components(gf16::Elem::ZERO, gf32::DELTA),
+        gf32::GENERATOR,
+    ];
+    let mut s = 0x243f_6a88u32;
+    for _ in 0..16 {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        v.push(gf32::Elem(s));
+    }
+    v
+}
+
+/// GF(2^64) coefficients, the same shape one level up.
+fn gf64_coeffs() -> Vec<gf64::Elem> {
+    let mut v = vec![
+        gf64::Elem::ZERO,
+        gf64::Elem::ONE,
+        gf64::Elem(u64::MAX),
+        gf64::Elem(0x0000_0000_ffff_ffff),
+        gf64::Elem(0xffff_ffff_0000_0000),
+        gf64::Elem::from_components(gf32::Elem::ONE, gf32::Elem::ZERO),
+        gf64::Elem::from_components(gf32::Elem::ZERO, gf32::Elem::ONE),
+        gf64::Elem::from_components(gf64::DELTA, gf32::Elem::ZERO),
+        gf64::Elem::from_components(gf32::Elem::ZERO, gf64::DELTA),
+        gf64::GENERATOR,
+    ];
+    let mut s = 0x243f_6a88_85a3_08d3u64;
+    for _ in 0..16 {
+        s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        v.push(gf64::Elem(s));
+    }
+    v
+}
+
+/// GF(2^32) lengths: multiples of 4 straddling every 32-byte lane boundary.
+const GF32_LENGTHS: &[usize] = &[
+    0, 4, 8, 16, 28, 32, 36, 60, 64, 68, 124, 128, 132, 252, 256, 260, 508, 512, 1020, 1024,
+];
+/// GF(2^64) lengths: multiples of 8.
+const GF64_LENGTHS: &[usize] = &[
+    0, 8, 16, 24, 32, 40, 56, 64, 72, 120, 128, 136, 248, 256, 264, 504, 512, 1016, 1024,
+];
+
+fn gf32_reference(dst: &mut [u8], coeff: gf32::Elem, src: &[u8]) {
+    scalar::mul_add::<Gf32>(dst, coeff, src);
+}
+fn gf32_assign_reference(dst: &mut [u8], coeff: gf32::Elem) {
+    scalar::mul_assign::<Gf32>(dst, coeff);
+}
+fn gf32_into_reference(dst: &mut [u8], coeff: gf32::Elem, src: &[u8]) {
+    dst.copy_from_slice(src);
+    scalar::mul_assign::<Gf32>(dst, coeff);
+}
+fn gf64_reference(dst: &mut [u8], coeff: gf64::Elem, src: &[u8]) {
+    scalar::mul_add::<Gf64>(dst, coeff, src);
+}
+fn gf64_assign_reference(dst: &mut [u8], coeff: gf64::Elem) {
+    scalar::mul_assign::<Gf64>(dst, coeff);
+}
+fn gf64_into_reference(dst: &mut [u8], coeff: gf64::Elem, src: &[u8]) {
+    dst.copy_from_slice(src);
+    scalar::mul_assign::<Gf64>(dst, coeff);
 }
 
 // ---------------------------------------------------------------------------
@@ -472,6 +611,69 @@ mod x86 {
         );
         check_gf8_elementwise("gf8 gfni elementwise", x86::gf8::elementwise_gfni);
         check_gf16_elementwise("gf16 gfni elementwise", x86::gf16::elementwise_gfni);
+        // Level-2/3 tower kernels: the period-2 lane multiply one and two
+        // levels up from the GF(2^16) kernel.
+        check_tower_gfni_kernels();
+    }
+
+    /// Differential-check the GFNI GF(2^32) and GF(2^64) kernels — the level-2
+    /// and level-3 tower multiplies — against the portable scalar oracle.
+    fn check_tower_gfni_kernels() {
+        check_tower_mul_add(
+            "gf32 gfni mul_add",
+            GF32_LENGTHS,
+            &gf32_coeffs(),
+            gf32_reference,
+            |dst, coeff, src| {
+                x86::gf32::mul_add_gfni(dst, coeff, x86::gf32::gf32_tiles(coeff), src);
+            },
+        );
+        check_tower_mul_assign(
+            "gf32 gfni mul_assign",
+            GF32_LENGTHS,
+            &gf32_coeffs(),
+            gf32_assign_reference,
+            |dst, coeff| {
+                x86::gf32::mul_assign_gfni(dst, coeff, x86::gf32::gf32_tiles(coeff));
+            },
+        );
+        check_tower_mul_into(
+            "gf32 gfni mul_into",
+            GF32_LENGTHS,
+            &gf32_coeffs(),
+            gf32_into_reference,
+            |dst, coeff, src| {
+                x86::gf32::mul_into_gfni(dst, coeff, x86::gf32::gf32_tiles(coeff), src);
+            },
+        );
+        // Level-3: the same identity over GF(2^32) lanes.
+        check_tower_mul_add(
+            "gf64 gfni mul_add",
+            GF64_LENGTHS,
+            &gf64_coeffs(),
+            gf64_reference,
+            |dst, coeff, src| {
+                x86::gf64::mul_add_gfni(dst, coeff, x86::gf64::gf64_tiles(coeff), src);
+            },
+        );
+        check_tower_mul_assign(
+            "gf64 gfni mul_assign",
+            GF64_LENGTHS,
+            &gf64_coeffs(),
+            gf64_assign_reference,
+            |dst, coeff| {
+                x86::gf64::mul_assign_gfni(dst, coeff, x86::gf64::gf64_tiles(coeff));
+            },
+        );
+        check_tower_mul_into(
+            "gf64 gfni mul_into",
+            GF64_LENGTHS,
+            &gf64_coeffs(),
+            gf64_into_reference,
+            |dst, coeff, src| {
+                x86::gf64::mul_into_gfni(dst, coeff, x86::gf64::gf64_tiles(coeff), src);
+            },
+        );
     }
 
     #[test]

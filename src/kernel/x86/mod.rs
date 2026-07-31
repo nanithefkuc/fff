@@ -20,6 +20,8 @@
 
 pub mod avx512;
 pub mod gf16;
+pub mod gf32;
+pub mod gf64;
 pub mod gf8;
 
 #[cfg(target_arch = "x86")]

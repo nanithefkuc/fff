@@ -12,6 +12,15 @@ All notable changes to this project are documented here. The format follows
   distributed through git only.
 
 ### Added
+- GF(2^32) and GF(2^64) GFNI kernels for x86: `mul_add`, `mul_assign`, and
+  `mul_into` as the tower identity one and two levels above the GF(2^16)
+  kernel — two (Gf32) or four (Gf64) GF(2^16) lane multiplies, each two
+  `GF2P8MULB`, folded into 4-/8-byte periodic broadcasts. On a 256 KiB
+  `mul_add` (Core Ultra 7 258V, Linux, rustc 1.93, gfni) this is ~63× (Gf32,
+  0.22 → 13.9 GiB/s) and ~56× (Gf64, 0.12 → 6.85 GiB/s) over the scalar
+  Karatsuba. Shuffle backends, NEON, wasm, and `mul_elementwise` keep the
+  portable path. A representation-agnostic `Tower2Coeff` carries the period-2
+  subfield coefficient pair for the GF(p) effort to reuse.
 
 - `internals` feature exposing the kernel modules and preparation types
   (`ScaleTable`, `TowerCoeff`, `TowerTables`, backend-specific SIMD entry
