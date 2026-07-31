@@ -34,7 +34,7 @@ use crate::kernel::Matrix;
 use crate::kernel::gf16::{
     Prepared, factor_tables, mul_add_scalar, mul_assign_scalar, mul_into_scalar,
 };
-use crate::kernel::tables::{ScaleTable, TowerCoeff, TowerTables};
+use crate::kernel::tables::{NibbleFactors, ScaleTable, TowerCoeff, TowerTables};
 
 /// A GF(2^16) coefficient in a form the shuffle kernels can consume.
 pub trait TableCoefficient {
@@ -364,30 +364,36 @@ unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
 }
 
 /// Nibble tables and lane masks for one coefficient, held in AVX2 registers.
-struct NibbleAvx2 {
+pub(crate) struct NibbleAvx2 {
     /// Low-nibble table of factor `i`, the same 16 entries in both halves.
-    lo: [__m256i; 4],
+    pub(crate) lo: [__m256i; 4],
     /// High-nibble table of factor `i`, the same 16 entries in both halves.
-    hi: [__m256i; 4],
+    pub(crate) hi: [__m256i; 4],
     /// `0x0f` in every byte: the nibble-extraction mask.
-    nibble: __m256i,
+    pub(crate) nibble: __m256i,
     /// `0x00ff` in every halfword: selects each element's even (low) byte.
-    even: __m256i,
+    pub(crate) even: __m256i,
     /// Adjacent-byte exchange control.
-    swap: __m256i,
+    pub(crate) swap: __m256i,
 }
 
-/// Widen the 16-byte tables of `tables` into AVX2 registers.
+/// Widen the 16-byte factor tables of `tables` into AVX2 registers.
+///
+/// Generic over [`NibbleFactors`] so the GF(2^16) (AES-base) and Fan–Paar
+/// (`fp8`-base) towers share this loader and the [`scale_avx2`] core.
 #[inline]
 #[target_feature(enable = "avx2")]
-fn nibble_avx2(tables: &TowerTables) -> NibbleAvx2 {
+pub(crate) fn nibble_avx2<T: NibbleFactors>(tables: &T) -> NibbleAvx2 {
     let mut lo = [_mm256_setzero_si256(); 4];
     let mut hi = [_mm256_setzero_si256(); 4];
-    for (slot, factor) in tables.factors.iter().enumerate() {
-        // SAFETY: `lo` and `hi` are `[u8; 16]`, exactly the width of the load.
+    for slot in 0..4 {
+        // SAFETY: `lo`/`hi` entries are `[u8; 16]`, exactly the width of the
+        // broadcast load.
         unsafe {
-            lo[slot] = _mm256_broadcastsi128_si256(_mm_loadu_si128(factor.lo.as_ptr().cast()));
-            hi[slot] = _mm256_broadcastsi128_si256(_mm_loadu_si128(factor.hi.as_ptr().cast()));
+            lo[slot] =
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(tables.lo(slot).as_ptr().cast()));
+            hi[slot] =
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(tables.hi(slot).as_ptr().cast()));
         }
     }
     NibbleAvx2 {
@@ -398,11 +404,10 @@ fn nibble_avx2(tables: &TowerTables) -> NibbleAvx2 {
         swap: swap_mask256(),
     }
 }
-
 /// Split `value` into its low and high nibbles, both as byte indices.
 #[inline]
 #[target_feature(enable = "avx2")]
-fn split_avx2(value: __m256i, nibble: __m256i) -> (__m256i, __m256i) {
+pub(crate) fn split_avx2(value: __m256i, nibble: __m256i) -> (__m256i, __m256i) {
     (
         _mm256_and_si256(value, nibble),
         _mm256_and_si256(_mm256_srli_epi16(value, 4), nibble),
@@ -412,7 +417,7 @@ fn split_avx2(value: __m256i, nibble: __m256i) -> (__m256i, __m256i) {
 /// One base-field byte multiply: two table lookups over pre-split nibbles.
 #[inline]
 #[target_feature(enable = "avx2")]
-fn lookup_avx2(lo: __m256i, hi: __m256i, split: (__m256i, __m256i)) -> __m256i {
+pub(crate) fn lookup_avx2(lo: __m256i, hi: __m256i, split: (__m256i, __m256i)) -> __m256i {
     _mm256_xor_si256(
         _mm256_shuffle_epi8(lo, split.0),
         _mm256_shuffle_epi8(hi, split.1),
@@ -426,7 +431,7 @@ fn lookup_avx2(lo: __m256i, hi: __m256i, split: (__m256i, __m256i)) -> __m256i {
 /// mask operations relative to grouping by direct/crossed.
 #[inline]
 #[target_feature(enable = "avx2")]
-fn scale_avx2(src: __m256i, tables: &NibbleAvx2) -> __m256i {
+pub(crate) fn scale_avx2(src: __m256i, tables: &NibbleAvx2) -> __m256i {
     let swapped = _mm256_shuffle_epi8(src, tables.swap);
     let direct = split_avx2(src, tables.nibble);
     let crossed = split_avx2(swapped, tables.nibble);
@@ -581,30 +586,33 @@ unsafe fn mul_into_avx2_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
 }
 
 /// Nibble tables and lane masks for one coefficient, held in SSE registers.
-struct NibbleSsse3 {
+pub(crate) struct NibbleSsse3 {
     /// Low-nibble table of factor `i`.
-    lo: [__m128i; 4],
+    pub(crate) lo: [__m128i; 4],
     /// High-nibble table of factor `i`.
-    hi: [__m128i; 4],
+    pub(crate) hi: [__m128i; 4],
     /// `0x0f` in every byte: the nibble-extraction mask.
-    nibble: __m128i,
+    pub(crate) nibble: __m128i,
     /// `0x00ff` in every halfword: selects each element's even (low) byte.
-    even: __m128i,
+    pub(crate) even: __m128i,
     /// Adjacent-byte exchange control.
-    swap: __m128i,
+    pub(crate) swap: __m128i,
 }
 
-/// Load the 16-byte tables of `tables` into SSE registers.
+/// Load the 16-byte factor tables of `tables` into SSE registers.
+///
+/// Generic over [`NibbleFactors`]; see [`nibble_avx2`].
 #[inline]
 #[target_feature(enable = "ssse3")]
-fn nibble_ssse3(tables: &TowerTables) -> NibbleSsse3 {
+pub(crate) fn nibble_ssse3<T: NibbleFactors>(tables: &T) -> NibbleSsse3 {
     let mut lo = [_mm_setzero_si128(); 4];
     let mut hi = [_mm_setzero_si128(); 4];
-    for (slot, factor) in tables.factors.iter().enumerate() {
-        // SAFETY: `lo` and `hi` are `[u8; 16]`, exactly the width of the load.
+    for slot in 0..4 {
+        // SAFETY: `lo`/`hi` entries are `[u8; 16]`, exactly the width of the
+        // load.
         unsafe {
-            lo[slot] = _mm_loadu_si128(factor.lo.as_ptr().cast());
-            hi[slot] = _mm_loadu_si128(factor.hi.as_ptr().cast());
+            lo[slot] = _mm_loadu_si128(tables.lo(slot).as_ptr().cast());
+            hi[slot] = _mm_loadu_si128(tables.hi(slot).as_ptr().cast());
         }
     }
     NibbleSsse3 {
@@ -619,7 +627,7 @@ fn nibble_ssse3(tables: &TowerTables) -> NibbleSsse3 {
 /// Split `value` into its low and high nibbles, both as byte indices.
 #[inline]
 #[target_feature(enable = "ssse3")]
-fn split_ssse3(value: __m128i, nibble: __m128i) -> (__m128i, __m128i) {
+pub(crate) fn split_ssse3(value: __m128i, nibble: __m128i) -> (__m128i, __m128i) {
     (
         _mm_and_si128(value, nibble),
         _mm_and_si128(_mm_srli_epi16(value, 4), nibble),
@@ -629,14 +637,14 @@ fn split_ssse3(value: __m128i, nibble: __m128i) -> (__m128i, __m128i) {
 /// One base-field byte multiply: two table lookups over pre-split nibbles.
 #[inline]
 #[target_feature(enable = "ssse3")]
-fn lookup_ssse3(lo: __m128i, hi: __m128i, split: (__m128i, __m128i)) -> __m128i {
+pub(crate) fn lookup_ssse3(lo: __m128i, hi: __m128i, split: (__m128i, __m128i)) -> __m128i {
     _mm_xor_si128(_mm_shuffle_epi8(lo, split.0), _mm_shuffle_epi8(hi, split.1))
 }
 
 /// `coeff * src` for one 16-byte lane, via four nibble-shuffle multiplies.
 #[inline]
 #[target_feature(enable = "ssse3")]
-fn scale_ssse3(src: __m128i, tables: &NibbleSsse3) -> __m128i {
+pub(crate) fn scale_ssse3(src: __m128i, tables: &NibbleSsse3) -> __m128i {
     let swapped = _mm_shuffle_epi8(src, tables.swap);
     let direct = split_ssse3(src, tables.nibble);
     let crossed = split_ssse3(swapped, tables.nibble);

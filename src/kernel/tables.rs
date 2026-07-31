@@ -19,8 +19,8 @@
 //! copies out of the shared bank ([`TowerTables::new`]) — amortized over the
 //! whole buffer, or hoisted out entirely with `Coeff`/`Plan`.
 
-use crate::field::gf8;
-use crate::field::gf16;
+use crate::field::fan_paar::{fp8, fp16};
+use crate::field::{gf8, gf16};
 
 /// Split-nibble multiplication tables for one GF(2^8) coefficient.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +152,157 @@ impl TowerTables {
                 *scale_table(f[3]),
             ],
         }
+    }
+}
+
+/// Split-nibble multiplication tables for one Fan–Paar `fp8` coefficient.
+///
+/// The canonical Fan–Paar byte field is *not* the AES field, so `GF2P8MULB`
+/// cannot multiply its bytes; every backend emulates the byte product with a
+/// 16-entry nibble lookup, exactly as [`ScaleTable`] does for GF(2^8). The
+/// two share a shape and a 256-entry static bank, but the multiplication
+/// used to *fill* them differs (fp8 tower vs. AES reduction).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FpScaleTable {
+    /// `lo[i] = coeff * i` for the low nibble.
+    pub lo: [u8; 16],
+    /// `hi[i] = coeff * (i << 4)` for the high nibble.
+    pub hi: [u8; 16],
+}
+
+impl FpScaleTable {
+    /// Build the nibble tables for `coeff` in the Fan–Paar byte field.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    #[allow(dead_code)]
+    pub const fn new(coeff: fp8::Elem) -> Self {
+        let mut lo = [0u8; 16];
+        let mut hi = [0u8; 16];
+        let mut i = 0;
+        while i < 16 {
+            lo[i] = fp8::Elem(i as u8).mul(coeff).0;
+            hi[i] = fp8::Elem((i as u8) << 4).mul(coeff).0;
+            i += 1;
+        }
+        Self { lo, hi }
+    }
+}
+
+/// Shared nibble-table bank, one entry per Fan–Paar `fp8` coefficient.
+///
+/// A separate bank from [`SCALE_TABLE_BANK`]: fp8 is a different field, so its
+/// products are different bytes. 8 KiB, resident in L1/L2, touched only by
+/// Fan–Paar kernels.
+#[allow(dead_code)]
+static FP_SCALE_TABLE_BANK: [FpScaleTable; 256] = build_fp_bank();
+
+#[allow(clippy::cast_possible_truncation)]
+#[allow(dead_code)]
+const fn build_fp_bank() -> [FpScaleTable; 256] {
+    let mut bank = [FpScaleTable::new(fp8::Elem(0)); 256];
+    let mut i = 0;
+    while i < 256 {
+        bank[i] = FpScaleTable::new(fp8::Elem(i as u8));
+        i += 1;
+    }
+    bank
+}
+
+/// Return the shared fp8 nibble tables for a Fan–Paar byte coefficient.
+#[inline]
+#[must_use]
+#[allow(dead_code)]
+pub fn fp_scale_table(coeff: fp8::Elem) -> &'static FpScaleTable {
+    &FP_SCALE_TABLE_BANK[coeff.0 as usize]
+}
+
+/// Four nibble-table factors a shuffle kernel consumes lane-by-lane.
+///
+/// Both GF(2^16) over GF(2^8) and Fan–Paar GF(2^16) over `fp8` reduce a
+/// 16-bit fixed-coefficient scale to four byte-wide multiplies — factors 0/1
+/// on the source's even/odd bytes, factors 2/3 on the adjacent-swapped
+/// source's. The multiply core in `kernel::x86::gf16` reads only the nibble
+/// tables, not the field they encode, so this trait lets the two fields share
+/// that core. Entries 0 and 1 apply to the source's even and odd byte lanes;
+/// 2 and 3 to the swapped source's.
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) trait NibbleFactors {
+    /// The low-nibble table of factor `i` (`0 <= i < 4`).
+    fn lo(&self, i: usize) -> &[u8; 16];
+    /// The high-nibble table of factor `i` (`0 <= i < 4`).
+    fn hi(&self, i: usize) -> &[u8; 16];
+}
+
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+impl NibbleFactors for TowerTables {
+    #[inline]
+    fn lo(&self, i: usize) -> &[u8; 16] {
+        &self.factors[i].lo
+    }
+    #[inline]
+    fn hi(&self, i: usize) -> &[u8; 16] {
+        &self.factors[i].hi
+    }
+}
+
+/// Nibble tables for the four `fp8` factors of a Fan–Paar GF(2^16)
+/// coefficient.
+///
+/// The Fan–Paar tower relation is `X² + alpha·X + 1 = 0` with `alpha` the
+/// `fp8` tower generator, so for `c = c0 + c1·X` and `x = x0 + x1·X`:
+///
+/// ```text
+/// r0 = c0·x0 ^ c1·x1
+/// r1 = (c0 ^ alpha·c1)·x1 ^ c1·x0
+/// ```
+///
+/// `alpha·(c1·x1) = (alpha·c1)·x1` because `alpha`, `c1`, `x1` all lie in the
+/// `fp8` subfield and the subfield commutes — so the `mul_alpha` fold lands in
+/// coefficient preparation, not in the kernel. The four factors are therefore
+/// `[c0, c0 ^ alpha·c1, c1, c1]`: 0/1 scale the source, 2/3 (both `c1`) the
+/// swapped source. This is the same four-table shape as [`TowerTables`], which
+/// is why the shuffle multiply core is shared.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FpTowerTables {
+    /// The Fan–Paar GF(2^16) coefficient, recovered for the portable scalar
+    /// tail of a vector kernel.
+    pub coeff: fp16::Elem,
+    /// Tables for `[c0, c0 ^ alpha·c1, c1, c1]`.
+    pub factors: [FpScaleTable; 4],
+}
+
+impl FpTowerTables {
+    /// Build the four `fp8` nibble tables for `coeff`.
+    #[inline]
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn new(coeff: fp16::Elem) -> Self {
+        let (c0, c1) = coeff.components();
+        // `c1.mul_alpha()` is `alpha·c1` in the fp8 subfield.
+        let b = c0.add(c1.mul_alpha());
+        let [f0, f1, f2, f3] = [c0, b, c1, c1];
+        Self {
+            coeff,
+            factors: [
+                *fp_scale_table(f0),
+                *fp_scale_table(f1),
+                *fp_scale_table(f2),
+                *fp_scale_table(f3),
+            ],
+        }
+    }
+}
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+impl NibbleFactors for FpTowerTables {
+    #[inline]
+    fn lo(&self, i: usize) -> &[u8; 16] {
+        &self.factors[i].lo
+    }
+    #[inline]
+    fn hi(&self, i: usize) -> &[u8; 16] {
+        &self.factors[i].hi
     }
 }
 

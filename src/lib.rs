@@ -14,10 +14,11 @@
 //! | GF(2^8)..GF(2^64) | [`FanPaar8`]..[`FanPaar64`] | [`fan_paar::fp8::Elem`]..[`fan_paar::fp64::Elem`] | canonical Fan–Paar tower |
 //!
 //! `Gf8` and `Gf16` have hand-written SIMD backends. The wider polynomial
-//! towers `Gf32`/`Gf64` run the same tower identity on x86 GFNI; on every
-//! other target they and the canonical Fan–Paar family use the portable
-//! kernels. All types share the same checked [`ops`] surface and stable
-//! little-endian encoding.
+//! towers `Gf32`/`Gf64` run the same tower identity on x86 GFNI, and the
+//! canonical Fan–Paar `FanPaar16` runs its four-nibble-shuffle tower on x86
+//! AVX2/SSSE3; on every other target those and the rest of the Fan–Paar
+//! family use the portable kernels. All types share the same checked [`ops`]
+//! surface and stable little-endian encoding.
 //!
 //! ## Two layers
 //!

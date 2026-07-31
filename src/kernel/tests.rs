@@ -17,9 +17,9 @@ extern crate std;
 use std::vec;
 use std::vec::Vec;
 
-use crate::field::{Gf32, Gf64, gf8, gf16, gf32, gf64};
+use crate::field::{FanPaar16, Gf32, Gf64, fan_paar, gf8, gf16, gf32, gf64};
 use crate::kernel::scalar;
-use crate::kernel::tables::{ScaleTable, TowerCoeff, TowerTables, scale_table};
+use crate::kernel::tables::{FpTowerTables, ScaleTable, TowerCoeff, TowerTables, scale_table};
 
 /// Lengths covering: empty, sub-lane, exact lanes, lane+1, several unroll
 /// tiles, and a large odd size. All even so GF(2^16) can use the same list.
@@ -332,6 +332,45 @@ fn gf8_reference(dst: &mut [u8], coeff: gf8::Elem, src: &[u8]) {
 
 fn gf16_reference(dst: &mut [u8], coeff: gf16::Elem, src: &[u8]) {
     scalar::mul_add::<gf16::Gf16>(dst, coeff, src);
+}
+
+/// Fan–Paar GF(2^16) coefficients: short-circuits, extremes, the tower
+/// generator and its components, and a deterministic spread.
+fn fp16_coeffs() -> Vec<fan_paar::fp16::Elem> {
+    use fan_paar::{fp8, fp16};
+    let mut v = vec![
+        fp16::Elem::ZERO,
+        fp16::Elem::ONE,
+        fp16::Elem(u16::MAX),
+        // Pure base-field and pure extension.
+        fp16::Elem::from_components(fp8::Elem::ONE, fp8::Elem::ZERO),
+        fp16::Elem::from_components(fp8::Elem::ZERO, fp8::Elem::ONE),
+        // The tower generator and its subfield tower generator.
+        fp16::GENERATOR,
+        fp16::ALPHA,
+    ];
+    let mut s = 0xf491u16;
+    for _ in 0..16 {
+        s = s.wrapping_mul(2057).wrapping_add(13849);
+        v.push(fp16::Elem(s));
+    }
+    v
+}
+
+/// Fan–Paar GF(2^16) lengths: multiples of 2 straddling 16/32-byte lanes.
+const FP16_LENGTHS: &[usize] = &[
+    0, 2, 4, 8, 14, 16, 18, 30, 32, 34, 62, 64, 66, 126, 128, 130, 254, 256, 510, 512, 1022,
+];
+
+fn fp16_reference(dst: &mut [u8], coeff: fan_paar::fp16::Elem, src: &[u8]) {
+    scalar::mul_add::<FanPaar16>(dst, coeff, src);
+}
+fn fp16_assign_reference(dst: &mut [u8], coeff: fan_paar::fp16::Elem) {
+    scalar::mul_assign::<FanPaar16>(dst, coeff);
+}
+fn fp16_into_reference(dst: &mut [u8], coeff: fan_paar::fp16::Elem, src: &[u8]) {
+    dst.copy_from_slice(src);
+    scalar::mul_assign::<FanPaar16>(dst, coeff);
 }
 
 /// GF(2^32) coefficients: the short-circuits, the extremes, pure tower
@@ -722,6 +761,34 @@ mod x86 {
             gf16_reference,
             x86::gf16::matrix_avx2,
         );
+        // Fan–Paar GF(2^16): the four-shuffle tower over the fp8 nibble bank.
+        check_tower_mul_add(
+            "fp16 avx2 mul_add",
+            FP16_LENGTHS,
+            &fp16_coeffs(),
+            fp16_reference,
+            |dst, coeff, src| {
+                x86::fan_paar::mul_add_avx2(dst, &FpTowerTables::new(coeff), src);
+            },
+        );
+        check_tower_mul_assign(
+            "fp16 avx2 mul_assign",
+            FP16_LENGTHS,
+            &fp16_coeffs(),
+            fp16_assign_reference,
+            |dst, coeff| {
+                x86::fan_paar::mul_assign_avx2(dst, &FpTowerTables::new(coeff));
+            },
+        );
+        check_tower_mul_into(
+            "fp16 avx2 mul_into",
+            FP16_LENGTHS,
+            &fp16_coeffs(),
+            fp16_into_reference,
+            |dst, coeff, src| {
+                x86::fan_paar::mul_into_avx2(dst, &FpTowerTables::new(coeff), src);
+            },
+        );
     }
 
     #[test]
@@ -769,6 +836,33 @@ mod x86 {
             gf16_coeff_at2,
             gf16_reference,
             x86::gf16::matrix_ssse3,
+        );
+        check_tower_mul_add(
+            "fp16 ssse3 mul_add",
+            FP16_LENGTHS,
+            &fp16_coeffs(),
+            fp16_reference,
+            |dst, coeff, src| {
+                x86::fan_paar::mul_add_ssse3(dst, &FpTowerTables::new(coeff), src);
+            },
+        );
+        check_tower_mul_assign(
+            "fp16 ssse3 mul_assign",
+            FP16_LENGTHS,
+            &fp16_coeffs(),
+            fp16_assign_reference,
+            |dst, coeff| {
+                x86::fan_paar::mul_assign_ssse3(dst, &FpTowerTables::new(coeff));
+            },
+        );
+        check_tower_mul_into(
+            "fp16 ssse3 mul_into",
+            FP16_LENGTHS,
+            &fp16_coeffs(),
+            fp16_into_reference,
+            |dst, coeff, src| {
+                x86::fan_paar::mul_into_ssse3(dst, &FpTowerTables::new(coeff), src);
+            },
         );
     }
 

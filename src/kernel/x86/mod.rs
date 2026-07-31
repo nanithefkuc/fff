@@ -19,6 +19,7 @@
 #![allow(clippy::incompatible_msrv)]
 
 pub mod avx512;
+pub mod fan_paar;
 pub mod gf16;
 pub mod gf32;
 pub mod gf64;
