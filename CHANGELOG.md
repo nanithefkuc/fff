@@ -21,6 +21,13 @@ All notable changes to this project are documented here. The format follows
   zero/one coefficient specialization. `mul_add_matrix` no longer falls back
   to the scalar kernel on wasm.
 
+### Changed
+
+- GF(2^16) scalar kernels (`Backend::Scalar` and every vector tail) multiply
+  through the shared nibble tables instead of a per-element Karatsuba
+  multiply: ~2.8x on `mul_add`/`mul_assign`/`mul_into`. The scalar scatter,
+  gather, and matrix fallbacks route through the same path.
+
 ### Fixed
 
 - wasm32 `simd128` test build, which referenced GF(2^8) scatter/gather/matrix

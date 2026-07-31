@@ -8,11 +8,12 @@
 //! factors with a nibble shuffle.
 
 use crate::field::gf16::{Elem, Gf16};
-// `Backend`, `TowerCoeff` and `TowerTables` are referenced only from the SIMD
-// dispatch arms, which cfg away entirely on a scalar-only build or on an
-// architecture without the corresponding backend.
+use crate::kernel::tables::{ScaleTable, TowerCoeff, scale_table};
+// `Backend` and `TowerTables` are referenced only from the SIMD dispatch
+// arms, which cfg away entirely on a scalar-only build or on an architecture
+// without the corresponding backend.
 #[allow(unused_imports)]
-use crate::kernel::tables::{TowerCoeff, TowerTables};
+use crate::kernel::tables::TowerTables;
 #[allow(unused_imports)]
 use crate::kernel::{Backend, FieldKernels, backend, scalar};
 
@@ -53,6 +54,24 @@ impl Prepared {
     }
 }
 
+/// The four base-field nibble tables for `coeff`, borrowed from the shared
+/// bank.
+///
+/// Deliberately not a [`TowerTables`]: that copies 136 bytes of table onto the
+/// stack, and the tail handlers below run on as little as a single two-byte
+/// element. Borrowing costs the two base multiplies of [`TowerCoeff::new`]
+/// plus four rodata indexes.
+#[inline]
+fn factor_tables(coeff: Elem) -> [&'static ScaleTable; 4] {
+    let f = TowerCoeff::new(coeff).factors();
+    [
+        scale_table(f[0]),
+        scale_table(f[1]),
+        scale_table(f[2]),
+        scale_table(f[3]),
+    ]
+}
+
 /// `dst ^= coeff * src` over interleaved elements, one element at a time.
 ///
 /// The tail handler for the vector kernels.
@@ -66,12 +85,27 @@ pub(crate) fn mul_add_scalar(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     mul_add_scalar_impl(dst, coeff, src);
 }
 
+/// Per element this is 8 nibble lookups and 7 XORs against the 3 base-field
+/// multiplies a Karatsuba [`Elem::mul`] performs — each of those a
+/// carry-less product plus reduction, and none of them shared between
+/// elements. Since `coeff` is fixed for the whole buffer its four base
+/// factors collapse into split-nibble tables once, so the loop body becomes
+/// pure loads.
 fn mul_add_scalar_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
+    if coeff == Elem::ZERO {
+        return;
+    }
+    if coeff == Elem::ONE {
+        scalar::xor(dst, src);
+        return;
+    }
+    let [f0, f1, f2, f3] = factor_tables(coeff);
     for (d, s) in dst.chunks_exact_mut(2).zip(src.chunks_exact(2)) {
-        let product = Elem::from_bytes([s[0], s[1]]).mul(coeff);
-        let current = Elem::from_bytes([d[0], d[1]]);
-        d.copy_from_slice(&current.add(product).to_bytes());
+        let (a_lo, a_hi) = ((s[0] & 0x0f) as usize, (s[0] >> 4) as usize);
+        let (b_lo, b_hi) = ((s[1] & 0x0f) as usize, (s[1] >> 4) as usize);
+        d[0] ^= f0.lo[a_lo] ^ f0.hi[a_hi] ^ f2.lo[b_lo] ^ f2.hi[b_hi];
+        d[1] ^= f1.lo[b_lo] ^ f1.hi[b_hi] ^ f3.lo[a_lo] ^ f3.hi[a_hi];
     }
 }
 
@@ -86,10 +120,22 @@ pub(crate) fn mul_assign_scalar(dst: &mut [u8], coeff: Elem) {
     mul_assign_scalar_impl(dst, coeff);
 }
 
+/// Table-driven for the same reason as [`mul_add_scalar_impl`], reading the
+/// destination as its own source.
 fn mul_assign_scalar_impl(dst: &mut [u8], coeff: Elem) {
+    if coeff == Elem::ONE {
+        return;
+    }
+    if coeff == Elem::ZERO {
+        dst.fill(0);
+        return;
+    }
+    let [f0, f1, f2, f3] = factor_tables(coeff);
     for d in dst.chunks_exact_mut(2) {
-        let value = Elem::from_bytes([d[0], d[1]]).mul(coeff);
-        d.copy_from_slice(&value.to_bytes());
+        let (a_lo, a_hi) = ((d[0] & 0x0f) as usize, (d[0] >> 4) as usize);
+        let (b_lo, b_hi) = ((d[1] & 0x0f) as usize, (d[1] >> 4) as usize);
+        d[0] = f0.lo[a_lo] ^ f0.hi[a_hi] ^ f2.lo[b_lo] ^ f2.hi[b_hi];
+        d[1] = f1.lo[b_lo] ^ f1.hi[b_hi] ^ f3.lo[a_lo] ^ f3.hi[a_hi];
     }
 }
 
@@ -108,11 +154,24 @@ pub(crate) fn mul_into_scalar(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     mul_into_scalar_impl(dst, coeff, src);
 }
 
+/// Table-driven for the same reason as [`mul_add_scalar_impl`], storing the
+/// product instead of accumulating it.
 fn mul_into_scalar_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
+    if coeff == Elem::ZERO {
+        dst.fill(0);
+        return;
+    }
+    if coeff == Elem::ONE {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let [f0, f1, f2, f3] = factor_tables(coeff);
     for (d, s) in dst.chunks_exact_mut(2).zip(src.chunks_exact(2)) {
-        let product = Elem::from_bytes([s[0], s[1]]).mul(coeff);
-        d.copy_from_slice(&product.to_bytes());
+        let (a_lo, a_hi) = ((s[0] & 0x0f) as usize, (s[0] >> 4) as usize);
+        let (b_lo, b_hi) = ((s[1] & 0x0f) as usize, (s[1] >> 4) as usize);
+        d[0] = f0.lo[a_lo] ^ f0.hi[a_hi] ^ f2.lo[b_lo] ^ f2.hi[b_hi];
+        d[1] = f1.lo[b_lo] ^ f1.hi[b_hi] ^ f3.lo[a_lo] ^ f3.hi[a_hi];
     }
 }
 
@@ -253,7 +312,14 @@ impl FieldKernels for Gf16 {
             Backend::Neon => aarch64::gf16::scatter_neon(rows, row_len, coeffs, src),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => wasm32::gf16::scatter_simd128(rows, row_len, coeffs, src),
-            _ => scalar::mul_add_scatter::<Gf16>(rows, row_len, coeffs, src),
+            // Not `scalar::mul_add_scatter`: that would re-derive a full
+            // Karatsuba multiply per element. `mul_add_scalar` amortizes one
+            // table resolve over each row.
+            _ => {
+                for (row, &coeff) in rows.chunks_exact_mut(row_len).zip(coeffs) {
+                    mul_add_scalar(row, coeff, src);
+                }
+            }
         }
     }
     fn mul_add_scatter_plan(
@@ -289,7 +355,13 @@ impl FieldKernels for Gf16 {
             Backend::Neon => aarch64::gf16::gather_neon(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => wasm32::gf16::gather_simd128(dst, coeffs, srcs),
-            _ => scalar::mul_add_gather::<Gf16>(dst, coeffs, srcs),
+            // See `mul_add_scatter`: one table resolve per term beats the
+            // generic oracle's per-element multiply.
+            _ => {
+                for (&coeff, &src) in coeffs.iter().zip(srcs) {
+                    mul_add_scalar(dst, coeff, src);
+                }
+            }
         }
     }
 
@@ -316,7 +388,16 @@ impl FieldKernels for Gf16 {
             Backend::Neon => aarch64::gf16::matrix_neon(rows, row_len, nrows, terms),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => wasm32::gf16::matrix_simd128(rows, row_len, nrows, terms),
-            _ => scalar::mul_add_matrix::<Gf16>(rows, row_len, nrows, terms),
+            // See `mul_add_scatter`: one table resolve per (term, row) beats
+            // the generic oracle's per-element multiply.
+            _ => {
+                for &(coeffs, src) in terms {
+                    let blocks = rows.chunks_exact_mut(row_len).take(nrows);
+                    for (row, &coeff) in blocks.zip(coeffs) {
+                        mul_add_scalar(row, coeff, src);
+                    }
+                }
+            }
         }
     }
     fn mul_add_matrix_plan(
