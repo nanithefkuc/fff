@@ -8,7 +8,14 @@
 //!
 //! Buffer lengths deliberately straddle every lane and unroll boundary. Most
 //! SIMD bugs live in the tail, not the body.
-#![cfg_attr(not(feature = "simd"), allow(dead_code))]
+// The tower and Fan–Paar differential helpers exist to compare a kernel
+// against the portable reference. Only x86 has kernels for those fields
+// today, so on any other target — or with `simd` off — the helpers have
+// nothing to drive and are legitimately dead.
+#![cfg_attr(
+    not(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64"))),
+    allow(dead_code)
+)]
 // Seeds and geometry are deliberately reduced to field widths below.
 #![allow(clippy::cast_possible_truncation)]
 
