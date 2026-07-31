@@ -34,8 +34,8 @@ MSRV is Rust 1.89.
 
 | Field | Marker | Element | Construction | Vector backend |
 | --- | --- | --- | --- | --- |
-| GF(2^8) | `Gf8` | `gf8::Elem` | AES polynomial `0x11B` | SIMD |
-| GF(2^16) | `Gf16` | `gf16::Elem` | quadratic tower over `Gf8` | SIMD |
+| GF(2^8) | `Gf8` | `gf8::Elem` | AES polynomial `0x11B` | GFNI x86 |
+| GF(2^16) | `Gf16` | `gf16::Elem` | quadratic tower over `Gf8` | GFNI x86 |
 | GF(2^32) | `Gf32` | `gf32::Elem` | quadratic tower over `Gf16` | GFNI x86 |
 | GF(2^64) | `Gf64` | `gf64::Elem` | quadratic tower over `Gf32` | GFNI x86 |
 | Fan–Paar GF(2^8) | `FanPaar8` | `fan_paar::fp8::Elem` | canonical recursive tower | portable |
