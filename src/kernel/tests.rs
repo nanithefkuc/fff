@@ -19,7 +19,9 @@ use std::vec::Vec;
 
 use crate::field::{FanPaar16, FanPaar32, FanPaar64, Gf32, Gf64, fan_paar, gf8, gf16, gf32, gf64};
 use crate::kernel::scalar;
-use crate::kernel::tables::{FpTowerTables, ScaleTable, TowerCoeff, TowerTables, scale_table};
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+use crate::kernel::tables::FpTowerTables;
+use crate::kernel::tables::{ScaleTable, TowerCoeff, TowerTables, scale_table};
 
 /// Lengths covering: empty, sub-lane, exact lanes, lane+1, several unroll
 /// tiles, and a large odd size. All even so GF(2^16) can use the same list.

@@ -1,6 +1,6 @@
 [package]
 name = "fff"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Faster Finite Fields: SIMD and portable binary tower arithmetic and vector kernels"
@@ -37,7 +37,11 @@ codegen-units = 1
 [[bench]]
 name = "kernels"
 harness = false
+# `ops::Plan` and the comparison harness are std-only; without this the bench
+# targets break `--no-default-features --all-targets`.
+required-features = ["std"]
 
 [[bench]]
 name = "compare"
 harness = false
+required-features = ["std"]
