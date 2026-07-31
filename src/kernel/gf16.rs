@@ -231,7 +231,12 @@ impl FieldKernels for Gf16 {
     fn has_vector_elementwise() -> bool {
         matches!(
             backend(),
-            Backend::Avx512 | Backend::Gfni | Backend::Neon | Backend::Simd128
+            Backend::Avx512
+                | Backend::Gfni
+                | Backend::Avx2
+                | Backend::Ssse3
+                | Backend::Neon
+                | Backend::Simd128
         )
     }
 
@@ -462,8 +467,13 @@ impl FieldKernels for Gf16 {
             Backend::Neon => aarch64::gf16::elementwise_neon(dst, a, b),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => wasm32::gf16::elementwise_simd128(dst, a, b),
-            // See `Gf8::mul_elementwise`: with both operands varying there is
-            // no fixed coefficient for a nibble table to be built from.
+            // See `Gf8::mul_elementwise`: no fixed coefficient, so the
+            // shuffle backends multiply the two varying base-field operands
+            // bit-serially and keep a nibble table only for constant `DELTA`.
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Avx2 => x86::gf16::elementwise_avx2(dst, a, b),
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Ssse3 => x86::gf16::elementwise_ssse3(dst, a, b),
             _ => scalar::mul_elementwise::<Gf16>(dst, a, b),
         }
     }

@@ -12,6 +12,15 @@ All notable changes to this project are documented here. The format follows
   distributed through git only.
 
 ### Added
+- `mul_elementwise` vector kernels for the shuffle-only x86 backends
+  (AVX2, SSSE3) for GF(2^8) and GF(2^16). With both operands varying there is
+  no nibble table to build, so the base-field product is the eight-round
+  branchless shift/reduce sequence already used on NEON and wasm, ported with
+  `PADDB`/`PCMPGTB` standing in for the byte shift x86 lacks; the GF(2^16)
+  tower keeps a nibble table for the one constant (`DELTA`) multiply. Core
+  Ultra 7 258V, Linux, rustc 1.93, 256 KiB: gf8 0.78 → 7.97 GiB/s (avx2) /
+  2.62 GiB/s (ssse3), gf16 0.43 → 4.39 GiB/s (avx2) / 1.48 GiB/s (ssse3).
+  `has_vector_elementwise::<Gf8/Gf16>()` now reports `true` on these backends.
 - GF(2^32) and GF(2^64) GFNI kernels for x86: `mul_add`, `mul_assign`, and
   `mul_into` as the tower identity one and two levels above the GF(2^16)
   kernel — two (Gf32) or four (Gf64) GF(2^16) lane multiplies, each two

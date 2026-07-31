@@ -35,7 +35,11 @@ is `avx512` or `gfni`.
   registers across sources.
 - `_with` operations separate coefficient preparation from byte-loop cost.
 - `mul_elementwise` has no broadcast coefficient. It vectorizes on
-  AVX-512/GFNI, NEON, and Wasm `simd128`; AVX2/SSSE3 use the scalar reference.
+  AVX-512/GFNI (native `GF2P8MULB`) and, via a branchless shift/reduce vector
+  multiply, on AVX2/SSSE3, NEON, and Wasm `simd128`. Measured on a Core Ultra
+  7 258V (Linux, rustc 1.93), 256 KiB buffers: gf8 0.78 → 7.97 GiB/s (AVX2)
+  and 2.62 GiB/s (SSSE3); gf16 0.43 → 4.39 GiB/s (AVX2) and 1.48 GiB/s
+  (SSSE3). The wider fields still use the scalar reference.
 
 Small GF(2^16) rows are sensitive to coefficient preparation because a shuffle
 backend builds four nibble tables per coefficient. Use `Coeff` or `Plan` when a

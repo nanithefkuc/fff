@@ -34,7 +34,7 @@ use crate::kernel::Matrix;
 use crate::kernel::gf16::{
     Prepared, factor_tables, mul_add_scalar, mul_assign_scalar, mul_into_scalar,
 };
-use crate::kernel::tables::{NibbleFactors, ScaleTable, TowerCoeff, TowerTables};
+use crate::kernel::tables::{NibbleFactors, ScaleTable, TowerCoeff, TowerTables, scale_table};
 
 /// A GF(2^16) coefficient in a form the shuffle kernels can consume.
 pub trait TableCoefficient {
@@ -1057,6 +1057,148 @@ unsafe fn elementwise_gfni_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
             _mm256_storeu_si256(dst_ptr.add(offset).cast(), product);
         }
         offset += 32;
+    }
+    for ((d, x), y) in dst[len..]
+        .chunks_exact_mut(2)
+        .zip(a[len..].chunks_exact(2))
+        .zip(b[len..].chunks_exact(2))
+    {
+        d.copy_from_slice(
+            &Elem::from_bytes([x[0], x[1]])
+                .mul(Elem::from_bytes([y[0], y[1]]))
+                .to_bytes(),
+        );
+    }
+}
+
+/// `DELTA * v` for every byte lane, by split-nibble `PSHUFB`.
+///
+/// The tower product needs one multiply by the *constant* `DELTA`, which —
+/// unlike the two varying-operand products around it — does have a nibble
+/// table. Two shuffles beat eight shift/reduce rounds.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn scale_delta_avx2(v: __m256i, lo: __m256i, hi: __m256i, nibble: __m256i) -> __m256i {
+    _mm256_xor_si256(
+        _mm256_shuffle_epi8(lo, _mm256_and_si256(v, nibble)),
+        _mm256_shuffle_epi8(hi, _mm256_and_si256(_mm256_srli_epi16::<4>(v), nibble)),
+    )
+}
+
+/// The 16-byte form of [`scale_delta_avx2`].
+#[inline]
+#[target_feature(enable = "ssse3")]
+fn scale_delta_sse(v: __m128i, lo: __m128i, hi: __m128i, nibble: __m128i) -> __m128i {
+    _mm_xor_si128(
+        _mm_shuffle_epi8(lo, _mm_and_si128(v, nibble)),
+        _mm_shuffle_epi8(hi, _mm_and_si128(_mm_srli_epi16::<4>(v), nibble)),
+    )
+}
+
+/// `dst[i] = a[i] * b[i]` over interleaved tower elements, AVX2.
+///
+/// Three base products, as everywhere else: `direct = [ac, bd]`,
+/// `crossed = [ad, bc]`, and `DELTA*bd`. The first two have two varying
+/// operands and use the shift/reduce vector multiply from
+/// [`super::gf8`]; the third is a constant multiply and stays a nibble
+/// shuffle.
+pub fn elementwise_avx2(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    debug_assert_eq!(dst.len(), a.len());
+    debug_assert_eq!(dst.len(), b.len());
+    // SAFETY: the selected backend guarantees AVX2, and all three lengths
+    // match.
+    unsafe { elementwise_avx2_impl(dst, a, b) }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn elementwise_avx2_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    let len = dst.len().min(a.len()).min(b.len()) & !31;
+    let (dst_ptr, a_ptr, b_ptr) = (dst.as_mut_ptr(), a.as_ptr(), b.as_ptr());
+    let swap = swap_mask256();
+    let even = _mm256_set1_epi16(0x00ff);
+    let nibble = _mm256_set1_epi8(0x0f);
+    let delta = scale_table(crate::field::gf16::DELTA);
+    // SAFETY: `lo` and `hi` are 16-byte arrays, exactly one `__m128i` each.
+    let (delta_lo, delta_hi) = unsafe {
+        (
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(delta.lo.as_ptr().cast())),
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(delta.hi.as_ptr().cast())),
+        )
+    };
+    let mut offset = 0;
+    while offset < len {
+        // SAFETY: `offset + 32 <= len`, which bounds all three slices.
+        unsafe {
+            let x = _mm256_loadu_si256(a_ptr.add(offset).cast());
+            let y = _mm256_loadu_si256(b_ptr.add(offset).cast());
+            let direct = super::gf8::multiply_vectors_avx2(x, y);
+            let crossed = super::gf8::multiply_vectors_avx2(x, _mm256_shuffle_epi8(y, swap));
+            let delta_bd = scale_delta_avx2(
+                _mm256_shuffle_epi8(direct, swap),
+                delta_lo,
+                delta_hi,
+                nibble,
+            );
+            let constant = _mm256_xor_si256(direct, delta_bd);
+            let cross_sum = _mm256_xor_si256(crossed, _mm256_shuffle_epi8(crossed, swap));
+            let extension = _mm256_xor_si256(cross_sum, direct);
+            let product = _mm256_xor_si256(
+                _mm256_and_si256(constant, even),
+                _mm256_andnot_si256(even, extension),
+            );
+            _mm256_storeu_si256(dst_ptr.add(offset).cast(), product);
+        }
+        offset += 32;
+    }
+    // SAFETY: AVX2 implies SSSE3, and the remainders keep equal lengths.
+    unsafe { elementwise_ssse3_impl(&mut dst[len..], &a[len..], &b[len..]) }
+}
+
+/// `dst[i] = a[i] * b[i]` over interleaved tower elements, SSSE3.
+pub fn elementwise_ssse3(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    debug_assert_eq!(dst.len(), a.len());
+    debug_assert_eq!(dst.len(), b.len());
+    // SAFETY: the selected backend guarantees SSSE3, and all three lengths
+    // match.
+    unsafe { elementwise_ssse3_impl(dst, a, b) }
+}
+
+#[inline]
+#[target_feature(enable = "ssse3")]
+unsafe fn elementwise_ssse3_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    let len = dst.len().min(a.len()).min(b.len()) & !15;
+    let (dst_ptr, a_ptr, b_ptr) = (dst.as_mut_ptr(), a.as_ptr(), b.as_ptr());
+    let swap = swap_mask128();
+    let even = _mm_set1_epi16(0x00ff);
+    let nibble = _mm_set1_epi8(0x0f);
+    let delta = scale_table(crate::field::gf16::DELTA);
+    // SAFETY: `lo` and `hi` are 16-byte arrays, exactly one `__m128i` each.
+    let (delta_lo, delta_hi) = unsafe {
+        (
+            _mm_loadu_si128(delta.lo.as_ptr().cast()),
+            _mm_loadu_si128(delta.hi.as_ptr().cast()),
+        )
+    };
+    let mut offset = 0;
+    while offset < len {
+        // SAFETY: `offset + 16 <= len`, which bounds all three slices.
+        unsafe {
+            let x = _mm_loadu_si128(a_ptr.add(offset).cast());
+            let y = _mm_loadu_si128(b_ptr.add(offset).cast());
+            let direct = super::gf8::multiply_vectors_sse(x, y);
+            let crossed = super::gf8::multiply_vectors_sse(x, _mm_shuffle_epi8(y, swap));
+            let delta_bd =
+                scale_delta_sse(_mm_shuffle_epi8(direct, swap), delta_lo, delta_hi, nibble);
+            let constant = _mm_xor_si128(direct, delta_bd);
+            let cross_sum = _mm_xor_si128(crossed, _mm_shuffle_epi8(crossed, swap));
+            let extension = _mm_xor_si128(cross_sum, direct);
+            let product = _mm_xor_si128(
+                _mm_and_si128(constant, even),
+                _mm_andnot_si128(even, extension),
+            );
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), product);
+        }
+        offset += 16;
     }
     for ((d, x), y) in dst[len..]
         .chunks_exact_mut(2)

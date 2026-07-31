@@ -834,6 +834,8 @@ mod x86 {
             gf16_reference,
             x86::gf16::matrix_avx2,
         );
+        check_gf8_elementwise("gf8 avx2 elementwise", x86::gf8::elementwise_avx2);
+        check_gf16_elementwise("gf16 avx2 elementwise", x86::gf16::elementwise_avx2);
         // Fan–Paar tower (GF(2^16)/32/64): the fp8 nibble tower and its
         // period-2 lane-mul extensions.
         check_fan_paar_avx2_kernels();
@@ -972,6 +974,8 @@ mod x86 {
             gf16_reference,
             x86::gf16::matrix_ssse3,
         );
+        check_gf8_elementwise("gf8 ssse3 elementwise", x86::gf8::elementwise_ssse3);
+        check_gf16_elementwise("gf16 ssse3 elementwise", x86::gf16::elementwise_ssse3);
         check_tower_mul_add(
             "fp16 ssse3 mul_add",
             FP16_LENGTHS,

@@ -105,7 +105,12 @@ impl FieldKernels for Gf8 {
     fn has_vector_elementwise() -> bool {
         matches!(
             backend(),
-            Backend::Avx512 | Backend::Gfni | Backend::Neon | Backend::Simd128
+            Backend::Avx512
+                | Backend::Gfni
+                | Backend::Avx2
+                | Backend::Ssse3
+                | Backend::Neon
+                | Backend::Simd128
         )
     }
 
@@ -293,9 +298,13 @@ impl FieldKernels for Gf8 {
             Backend::Neon => aarch64::gf8::elementwise_neon(dst, a, b),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => wasm32::gf8::elementwise_simd128(dst, a, b),
-            // A nibble table is indexed by one varying operand against one
-            // *fixed* coefficient. With both operands varying there is no
-            // table to build, so the shuffle backends have nothing to offer.
+            // No fixed coefficient means no nibble table, so the shuffle
+            // backends use the same eight branchless shift/reduce rounds as
+            // baseline NEON and wasm.
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Avx2 => x86::gf8::elementwise_avx2(dst, a, b),
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Ssse3 => x86::gf8::elementwise_ssse3(dst, a, b),
             _ => scalar::mul_elementwise::<Gf8>(dst, a, b),
         }
     }

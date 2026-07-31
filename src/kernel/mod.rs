@@ -586,9 +586,9 @@ pub trait FieldKernels: Field + private::Sealed {
     /// `dst[i] = a[i] * b[i]`, elementwise over two full vectors.
     ///
     /// Both operands vary per lane, so there is no coefficient to broadcast
-    /// and no table to index. GFNI multiplies vectors directly; `AArch64` and
-    /// Wasm have lane-parallel implementations. Shuffle-only x86 backends run
-    /// the reference path.
+    /// and no table to index. GFNI multiplies vectors directly; `AArch64`,
+    /// Wasm, and the shuffle-only x86 backends use a branchless
+    /// shift/reduce vector multiply. The wider fields run the reference path.
     fn mul_elementwise(dst: &mut [u8], a: &[u8], b: &[u8]);
 }
 

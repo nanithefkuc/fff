@@ -1194,6 +1194,112 @@ unsafe fn elementwise_gfni_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
     }
 }
 
+/// Lane-parallel GF(2^8) multiplication of two varying byte vectors.
+///
+/// Without `GF2P8MULB` there is no fixed coefficient to build a nibble table
+/// from, so the product comes from eight branchless shift/reduce rounds — the
+/// sequence already proven on NEON and wasm. x86 has no byte shift: `PADDB`
+/// doubles each lane (a left shift that drops the carry) and the signed
+/// `PCMPGTB` against zero recovers the bit it dropped.
+#[inline]
+#[target_feature(enable = "avx2")]
+pub(super) fn multiply_vectors_avx2(mut a: __m256i, mut b: __m256i) -> __m256i {
+    let zero = _mm256_setzero_si256();
+    let one = _mm256_set1_epi8(1);
+    let reduction = _mm256_set1_epi8(0x1b);
+    let low7 = _mm256_set1_epi8(0x7f);
+    let mut product = zero;
+    for round in 0..8 {
+        let active = _mm256_cmpeq_epi8(_mm256_and_si256(b, one), one);
+        product = _mm256_xor_si256(product, _mm256_and_si256(a, active));
+        if round == 7 {
+            break;
+        }
+        let carry = _mm256_cmpgt_epi8(zero, a);
+        a = _mm256_xor_si256(_mm256_add_epi8(a, a), _mm256_and_si256(reduction, carry));
+        b = _mm256_and_si256(_mm256_srli_epi16::<1>(b), low7);
+    }
+    product
+}
+
+/// The 16-byte form of [`multiply_vectors_avx2`].
+#[inline]
+#[target_feature(enable = "ssse3")]
+pub(super) fn multiply_vectors_sse(mut a: __m128i, mut b: __m128i) -> __m128i {
+    let zero = _mm_setzero_si128();
+    let one = _mm_set1_epi8(1);
+    let reduction = _mm_set1_epi8(0x1b);
+    let low7 = _mm_set1_epi8(0x7f);
+    let mut product = zero;
+    for round in 0..8 {
+        let active = _mm_cmpeq_epi8(_mm_and_si128(b, one), one);
+        product = _mm_xor_si128(product, _mm_and_si128(a, active));
+        if round == 7 {
+            break;
+        }
+        let carry = _mm_cmpgt_epi8(zero, a);
+        a = _mm_xor_si128(_mm_add_epi8(a, a), _mm_and_si128(reduction, carry));
+        b = _mm_and_si128(_mm_srli_epi16::<1>(b), low7);
+    }
+    product
+}
+
+/// `dst[i] = a[i] * b[i]` by branchless shift/reduce over 32-byte lanes.
+pub fn elementwise_avx2(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    debug_assert_eq!(dst.len(), a.len());
+    debug_assert_eq!(dst.len(), b.len());
+    // SAFETY: the selected backend guarantees AVX2, and all three lengths
+    // match.
+    unsafe { elementwise_avx2_impl(dst, a, b) }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn elementwise_avx2_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    let len = dst.len().min(a.len()).min(b.len()) & !31;
+    let (dst_ptr, a_ptr, b_ptr) = (dst.as_mut_ptr(), a.as_ptr(), b.as_ptr());
+    let mut offset = 0;
+    while offset < len {
+        // SAFETY: `offset + 32 <= len`, which bounds all three slices.
+        unsafe {
+            let x = _mm256_loadu_si256(a_ptr.add(offset).cast());
+            let y = _mm256_loadu_si256(b_ptr.add(offset).cast());
+            _mm256_storeu_si256(dst_ptr.add(offset).cast(), multiply_vectors_avx2(x, y));
+        }
+        offset += 32;
+    }
+    // SAFETY: AVX2 implies SSSE3, and the remainders keep equal lengths.
+    unsafe { elementwise_ssse3_impl(&mut dst[len..], &a[len..], &b[len..]) }
+}
+
+/// `dst[i] = a[i] * b[i]` by branchless shift/reduce over 16-byte lanes.
+pub fn elementwise_ssse3(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    debug_assert_eq!(dst.len(), a.len());
+    debug_assert_eq!(dst.len(), b.len());
+    // SAFETY: the selected backend guarantees SSSE3, and all three lengths
+    // match.
+    unsafe { elementwise_ssse3_impl(dst, a, b) }
+}
+
+#[inline]
+#[target_feature(enable = "ssse3")]
+unsafe fn elementwise_ssse3_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    let len = dst.len().min(a.len()).min(b.len()) & !15;
+    let (dst_ptr, a_ptr, b_ptr) = (dst.as_mut_ptr(), a.as_ptr(), b.as_ptr());
+    let mut offset = 0;
+    while offset < len {
+        // SAFETY: `offset + 16 <= len`, which bounds all three slices.
+        unsafe {
+            let x = _mm_loadu_si128(a_ptr.add(offset).cast());
+            let y = _mm_loadu_si128(b_ptr.add(offset).cast());
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), multiply_vectors_sse(x, y));
+        }
+        offset += 16;
+    }
+    for ((d, &x), &y) in dst[len..].iter_mut().zip(&a[len..]).zip(&b[len..]) {
+        *d = Elem(x).mul(Elem(y)).0;
+    }
+}
+
 /// Many sources into one destination, register-blocked over 128-byte tiles.
 pub fn gather_gfni(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
