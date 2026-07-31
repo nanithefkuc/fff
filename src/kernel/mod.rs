@@ -105,6 +105,13 @@ pub enum Backend {
     Avx2,
     /// x86 SSSE3 split-nibble shuffle over 16-byte lanes.
     Ssse3,
+    /// `AArch64` NEON + PMULL. Everything [`Backend::Neon`] does, plus
+    /// `PMULL` for the one shape it wins: a varying operand pair, where the
+    /// alternative is eight bit-serial rounds. Fixed coefficients still use
+    /// the nibble shuffle — PMULL's reduction network measured 4–7x slower
+    /// there. Detecting the extension once, here, is what keeps
+    /// [`FieldKernels::mul_elementwise`] from probing it per call.
+    Pmull,
     /// `AArch64` NEON split-nibble shuffle over 16-byte lanes.
     Neon,
     /// WebAssembly `simd128` split-nibble shuffle over 16-byte lanes.
@@ -115,11 +122,12 @@ pub enum Backend {
 
 impl Backend {
     /// Every backend identifier, in detection-preference order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Avx512,
         Self::Gfni,
         Self::Avx2,
         Self::Ssse3,
+        Self::Pmull,
         Self::Neon,
         Self::Simd128,
         Self::Scalar,
@@ -152,7 +160,13 @@ impl Backend {
             }
             #[cfg(target_arch = "aarch64")]
             {
+                // NEON is baseline; PMULL rides in the optional crypto
+                // extension. Probing it here rather than per call is the whole
+                // point of caching a backend.
                 if std::arch::is_aarch64_feature_detected!("neon") {
+                    if std::arch::is_aarch64_feature_detected!("pmull") {
+                        return Self::Pmull;
+                    }
                     return Self::Neon;
                 }
             }
@@ -176,7 +190,7 @@ impl Backend {
     #[inline]
     #[must_use]
     pub const fn has_blocked_rows(self) -> bool {
-        matches!(self, Self::Avx512 | Self::Gfni | Self::Neon)
+        matches!(self, Self::Avx512 | Self::Gfni | Self::Neon | Self::Pmull)
     }
 
     /// Vector width in bytes.
@@ -186,7 +200,7 @@ impl Backend {
         match self {
             Self::Avx512 => 64,
             Self::Gfni | Self::Avx2 => 32,
-            Self::Ssse3 | Self::Neon | Self::Simd128 => 16,
+            Self::Ssse3 | Self::Neon | Self::Pmull | Self::Simd128 => 16,
             Self::Scalar => 8,
         }
     }
@@ -199,6 +213,7 @@ impl Backend {
             Self::Gfni => "gfni",
             Self::Avx2 => "avx2",
             Self::Ssse3 => "ssse3",
+            Self::Pmull => "pmull",
             Self::Neon => "neon",
             Self::Simd128 => "simd128",
             Self::Scalar => "scalar",
@@ -213,6 +228,7 @@ impl Backend {
             "gfni" => Self::Gfni,
             "avx2" => Self::Avx2,
             "ssse3" => Self::Ssse3,
+            "pmull" => Self::Pmull,
             "neon" => Self::Neon,
             "simd128" => Self::Simd128,
             "scalar" => Self::Scalar,
@@ -227,7 +243,7 @@ impl Backend {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Self::Avx512 | Self::Gfni | Self::Avx2 | Self::Ssse3 => true,
             #[cfg(target_arch = "aarch64")]
-            Self::Neon => true,
+            Self::Neon | Self::Pmull => true,
             #[cfg(target_arch = "wasm32")]
             Self::Simd128 => true,
             Self::Scalar => true,
@@ -286,7 +302,7 @@ fn resolve_backend() -> Backend {
 /// The backend these kernels use, detected once per process.
 ///
 /// May be downgraded at startup via the `FFF_BACKEND` environment variable
-/// (`avx512`, `gfni`, `avx2`, `ssse3`, `neon`, `simd128`, `scalar`).
+/// (`avx512`, `gfni`, `avx2`, `ssse3`, `pmull`, `neon`, `simd128`, `scalar`).
 /// Requests for a backend the host cannot run are ignored.
 #[inline]
 #[must_use]
@@ -624,7 +640,7 @@ fn xor_impl(dst: &mut [u8], src: &[u8]) {
         #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
         Backend::Ssse3 => x86::xor_sse2(dst, src),
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-        Backend::Neon => aarch64::xor_neon(dst, src),
+        Backend::Neon | Backend::Pmull => aarch64::xor_neon(dst, src),
         #[cfg(all(feature = "simd", target_arch = "wasm32"))]
         Backend::Simd128 => wasm32::xor_simd128(dst, src),
         _ => scalar::xor(dst, src),

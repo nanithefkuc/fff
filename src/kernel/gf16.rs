@@ -33,7 +33,7 @@ use crate::kernel::x86;
 /// host builds them once instead of on every call.
 #[derive(Clone, Debug)]
 pub enum Prepared {
-    /// Native byte multiply (GFNI): a pair of broadcast words.
+    /// Native byte multiply (GFNI) or `PMULL`: a pair of broadcast words.
     Compact(TowerCoeff),
     /// Shuffle backends (AVX2, SSSE3, NEON): four nibble tables.
     Tables(TowerTables),
@@ -211,7 +211,11 @@ impl FieldKernels for Gf16 {
     fn prepare(coeff: Elem) -> Prepared {
         match backend() {
             Backend::Avx512 | Backend::Gfni => Prepared::Compact(TowerCoeff::new(coeff)),
-            Backend::Avx2 | Backend::Ssse3 | Backend::Neon | Backend::Simd128 => {
+            // PMULL is table-free, so the broadcast-word form looks like the
+            // natural fit here. It is not: measured 0.26x against these four
+            // nibble tables (see `aarch64::gf16`), so PMULL hosts prepare and
+            // shuffle exactly like baseline NEON.
+            Backend::Avx2 | Backend::Ssse3 | Backend::Pmull | Backend::Neon | Backend::Simd128 => {
                 Prepared::Tables(TowerTables::new(coeff))
             }
             Backend::Scalar => Prepared::Plain(coeff),
@@ -235,6 +239,7 @@ impl FieldKernels for Gf16 {
                 | Backend::Gfni
                 | Backend::Avx2
                 | Backend::Ssse3
+                | Backend::Pmull
                 | Backend::Neon
                 | Backend::Simd128
         )
@@ -315,8 +320,13 @@ impl FieldKernels for Gf16 {
             Backend::Avx2 => x86::gf16::scatter_avx2(rows, row_len, coeffs, src),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Ssse3 => x86::gf16::scatter_ssse3(rows, row_len, coeffs, src),
+            // Multi-row shapes keep the nibble tables: they derive them once
+            // per coefficient and then amortize the cheaper byte loop over
+            // every row of the group, which is the trade PMULL loses.
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon => aarch64::gf16::scatter_neon(rows, row_len, coeffs, src),
+            Backend::Neon | Backend::Pmull => {
+                aarch64::gf16::scatter_neon(rows, row_len, coeffs, src);
+            }
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => wasm32::gf16::scatter_simd128(rows, row_len, coeffs, src),
             // Not `scalar::mul_add_scatter`: that would re-derive a full
@@ -365,7 +375,7 @@ impl FieldKernels for Gf16 {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Ssse3 => x86::gf16::gather_ssse3(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon => aarch64::gf16::gather_neon(dst, coeffs, srcs),
+            Backend::Neon | Backend::Pmull => aarch64::gf16::gather_neon(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => wasm32::gf16::gather_simd128(dst, coeffs, srcs),
             // See `mul_add_scatter`: one table resolve per term beats the
@@ -398,7 +408,9 @@ impl FieldKernels for Gf16 {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Ssse3 => x86::gf16::matrix_ssse3(rows, row_len, nrows, terms),
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon => aarch64::gf16::matrix_neon(rows, row_len, nrows, terms),
+            Backend::Neon | Backend::Pmull => {
+                aarch64::gf16::matrix_neon(rows, row_len, nrows, terms);
+            }
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => wasm32::gf16::matrix_simd128(rows, row_len, nrows, terms),
             // See `mul_add_scatter`: one table resolve per (term, row) beats
@@ -463,12 +475,14 @@ impl FieldKernels for Gf16 {
             Backend::Avx512 => x86::avx512::gf16_elementwise(dst, a, b),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Gfni => x86::gf16::elementwise_gfni(dst, a, b),
+            // Unlike GF(2^8), the tower elementwise product does *not* prefer
+            // PMULL: the same three-multiply identity over `vmull_p8` measured
+            // 0.88–0.92x against these bit-serial rounds on a Snapdragon 8
+            // Gen 3, so that kernel was removed rather than wired. (gf8
+            // elementwise, where PMULL replaces eight bit-serial rounds with
+            // two multiplies, is 1.55x — see `Gf8::mul_elementwise`.)
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon if std::arch::is_aarch64_feature_detected!("aes") => {
-                aarch64::gf16::elementwise_pmull(dst, a, b);
-            }
-            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon => aarch64::gf16::elementwise_neon(dst, a, b),
+            Backend::Neon | Backend::Pmull => aarch64::gf16::elementwise_neon(dst, a, b),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => wasm32::gf16::elementwise_simd128(dst, a, b),
             // See `Gf8::mul_elementwise`: no fixed coefficient, so the

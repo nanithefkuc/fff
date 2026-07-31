@@ -363,7 +363,7 @@ fn bench_small_row_shapes() {
 
 fn main() {
     println!("fff kernel benchmark — backend: {}", backend().name());
-    println!("  (override with FFF_BACKEND=avx512|gfni|avx2|ssse3|neon|scalar)\n");
+    println!("  (override with FFF_BACKEND=avx512|gfni|avx2|ssse3|pmull|neon|scalar)\n");
 
     bench_preparation_crossover();
     bench_small_row_shapes();

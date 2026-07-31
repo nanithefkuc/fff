@@ -136,11 +136,12 @@ boundary of `mul_elementwise`.
 | `gfni` | x86 AVX2 + GFNI | 32 bytes |
 | `avx2` | x86 AVX2 shuffle | 32 bytes |
 | `ssse3` | x86 SSSE3 shuffle | 16 bytes |
-| `neon` | AArch64 NEON; optional PMULL for varying operands | 16 bytes |
+| `pmull` | AArch64 NEON + PMULL; adds a vector `mul_elementwise` for GF(2^8) | 16 bytes |
+| `neon` | AArch64 NEON split-nibble shuffle | 16 bytes |
 | `simd128` | WebAssembly `simd128` | 16 bytes |
 | `scalar` | portable fallback | scalar |
 
-`FFF_BACKEND=avx512|gfni|avx2|ssse3|neon|simd128|scalar` requests a backend at
+`FFF_BACKEND=avx512|gfni|avx2|ssse3|pmull|neon|simd128|scalar` requests a backend at
 process startup. It is downgrade-only: an unsupported upgrade is ignored.
 `Backend::ALL`, `Display`, and `FromStr` support diagnostics and CLI wiring.
 

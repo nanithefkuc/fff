@@ -122,6 +122,30 @@ The gf16 two-lane unroll is what moves `mul_add`; it wins at every size from
 binary reports anything from 0.65x to 1.11x — that spread is core migration,
 not the kernel.
 
+### PMULL against the nibble shuffle
+
+`Backend::Pmull` and `Backend::Neon` differ by dispatch alone, so
+`FFF_BACKEND=pmull` against `FFF_BACKEND=neon` in **one binary** is the
+cleanest A/B this crate has. Same device, one pinned big core, max of three
+runs each:
+
+| Shape | `neon` | `pmull` | |
+| --- | --- | --- | --- |
+| gf8 `mul_elementwise`, 4 KiB … 8 MiB | 0.83 GiB/s | 1.28–1.30 GiB/s | **1.55x** |
+| gf16 `mul_elementwise`, 4 KiB … 8 MiB | 0.39–0.41 GiB/s | 0.36 GiB/s | 0.88–0.92x |
+| gf8 `mul_add` fixed coefficient | 9.0–9.2 GiB/s | 1.17–1.23 GiB/s | 0.13x |
+| gf16 `mul_add` fixed coefficient | 2.4 GiB/s | 0.62 GiB/s | 0.26x |
+
+Only the first line survived into dispatch. `PMULL` pays when it replaces
+eight bit-serial rounds; against `vqtbl1q_u8`'s five instructions it cannot
+carry its twenty-instruction reduction network, and against the tower's
+three-multiply identity it merely ties. The losing kernels were deleted, with
+the numbers kept in `src/kernel/aarch64/`.
+
+Everything else in the run matches within 3% — except rows of 16–128 B, where
+dispatch-identical code varied by up to 1.36x between the two runs. Treat
+anything measured on rows that small as noise unless it survives many runs.
+
 Node 26 WASI (`wasm32-wasip1`, `simd128`, rustc 1.93), maximum of four
 interleaved runs, GF(2^8) `xor`/`elementwise` as control (1.00x):
 

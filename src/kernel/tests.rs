@@ -1119,12 +1119,15 @@ mod aarch64 {
 
     #[test]
     fn pmull_kernels_match_reference() {
-        if !std::arch::is_aarch64_feature_detected!("aes") {
-            eprintln!("skipping: no AArch64 AES/PMULL extension on this host");
+        if !std::arch::is_aarch64_feature_detected!("pmull") {
+            eprintln!("skipping: no AArch64 PMULL extension on this host");
             return;
         }
         check_gf8_elementwise("gf8 pmull elementwise", aarch64::gf8::elementwise_pmull);
-        check_gf16_elementwise("gf16 pmull elementwise", aarch64::gf16::elementwise_pmull);
+        // The tower elementwise and every fixed-coefficient PMULL kernel were
+        // measured against the nibble/bit-serial paths and lost (0.88x and
+        // 0.13–0.26x); GF(2^8) elementwise is the shape that won and the only
+        // one dispatch selects.
     }
 
     #[test]

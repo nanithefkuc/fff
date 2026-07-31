@@ -657,6 +657,14 @@ fn multiply_base_vectors(mut a: uint8x16_t, mut b: uint8x16_t) -> uint8x16_t {
     product
 }
 
+// The tower form of the same identity over `PMULL` — two period-2 broadcasts
+// (`[c0, c0+c1]` on the block, `[DELTA*c1, c1]` on its adjacent-byte swap),
+// no nibble tables at all — was written and measured at **0.26x** against the
+// four-shuffle kernels above, at every row length from 16 B to 64 KiB. Cheap
+// preparation only paid below 32-byte rows, and only for one-shot calls
+// (1.5x at 16 B), which is not worth carrying a second prepared form for.
+// See the note in `super::gf8` for the instruction-count reason.
+
 /// `dst[i] = a[i] * b[i]` over interleaved tower elements.
 pub fn elementwise_neon(dst: &mut [u8], a: &[u8], b: &[u8]) {
     debug_assert_eq!(dst.len(), a.len());
@@ -685,58 +693,6 @@ unsafe fn elementwise_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
             let direct = multiply_base_vectors(x, y);
             let crossed = multiply_base_vectors(x, vrev16q_u8(y));
             let delta_bd = multiply_base_vectors(vrev16q_u8(direct), delta_even);
-            let constant = veorq_u8(direct, delta_bd);
-            let extension = veorq_u8(veorq_u8(crossed, vrev16q_u8(crossed)), direct);
-            vst1q_u8(
-                dst.as_mut_ptr().add(offset),
-                vbslq_u8(even, constant, extension),
-            );
-        }
-        offset += 16;
-    }
-    for ((d, x), y) in dst[len..]
-        .chunks_exact_mut(2)
-        .zip(a[len..].chunks_exact(2))
-        .zip(b[len..].chunks_exact(2))
-    {
-        d.copy_from_slice(
-            &Elem::from_bytes([x[0], x[1]])
-                .mul(Elem::from_bytes([y[0], y[1]]))
-                .to_bytes(),
-        );
-    }
-}
-
-/// `dst[i] = a[i] * b[i]` over tower elements using the optional `PMULL`
-/// extension for each base-field product.
-pub fn elementwise_pmull(dst: &mut [u8], a: &[u8], b: &[u8]) {
-    debug_assert_eq!(dst.len(), a.len());
-    debug_assert_eq!(dst.len(), b.len());
-    // SAFETY: dispatch checked the AArch64 `aes` feature, which includes
-    // `PMULL`, and all three lengths match.
-    unsafe { elementwise_pmull_impl(dst, a, b) }
-}
-
-#[target_feature(enable = "neon,aes")]
-unsafe fn elementwise_pmull_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
-    let len = dst.len().min(a.len()).min(b.len()) & !15;
-    let even = vreinterpretq_u8_u16(vdupq_n_u16(0x00ff));
-    let delta_even = vreinterpretq_u8_u16(vdupq_n_u16(u16::from_le_bytes([
-        crate::field::gf16::DELTA.0,
-        0,
-    ])));
-    let mut offset = 0;
-    while offset < len {
-        // For x=[a,b], y=[c,d]:
-        // constant = ac ^ DELTA*bd
-        // extension = ad ^ bc ^ bd.
-        // SAFETY: `offset + 16 <= len`, which bounds all three slices.
-        unsafe {
-            let x = vld1q_u8(a.as_ptr().add(offset));
-            let y = vld1q_u8(b.as_ptr().add(offset));
-            let direct = super::gf8::multiply_vectors_pmull(x, y);
-            let crossed = super::gf8::multiply_vectors_pmull(x, vrev16q_u8(y));
-            let delta_bd = super::gf8::multiply_vectors_pmull(vrev16q_u8(direct), delta_even);
             let constant = veorq_u8(direct, delta_bd);
             let extension = veorq_u8(veorq_u8(crossed, vrev16q_u8(crossed)), direct);
             vst1q_u8(

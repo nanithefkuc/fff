@@ -12,6 +12,13 @@ All notable changes to this project are documented here. The format follows
   distributed through git only.
 
 ### Added
+- `Backend::Pmull`: `AArch64` NEON plus the optional PMULL extension, detected
+  once at startup and selected ahead of `Backend::Neon`. It replaces a
+  per-call `is_aarch64_feature_detected!("aes")` probe inside
+  `mul_elementwise`, probes the accurate feature name (`pmull`, not the AES
+  bundle), and makes `FFF_BACKEND=neon` able to turn PMULL off. Accepted by
+  `FFF_BACKEND`, `Backend::ALL`, `Display` and `FromStr` like every other
+  identifier.
 - Fused GF(2^16) `mul_into` for NEON and wasm `simd128`; both backends used the
   default copy-then-scale before. Both fields' GF(2^16) kernels are
   compute-bound on those targets, so halving destination traffic is worth a few
@@ -81,6 +88,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- GF(2^16) `mul_elementwise` no longer uses PMULL on `AArch64`. The
+  three-multiply tower identity over `vmull_p8` measured 0.88–0.92x against the
+  bit-serial rounds on a Snapdragon 8 Gen 3, so that kernel was removed and the
+  NEON path serves PMULL hosts too. GF(2^8) `mul_elementwise`, where PMULL
+  replaces eight bit-serial rounds with two multiplies, keeps it at 1.55x.
+- Fixed-coefficient PMULL kernels were written, measured, and **not** kept:
+  0.13x (GF(2^8)) and 0.26x (GF(2^16)) against the split-nibble shuffle at every
+  size from 4 KiB to 8 MiB — two `vmull_p8`s plus a twenty-instruction reduction
+  network against five instructions of `vqtbl1q_u8`. The numbers now sit beside
+  the surviving kernels in `src/kernel/aarch64/`.
 - GF(2^16) scalar kernels (`Backend::Scalar` and every vector tail) multiply
   through the shared nibble tables instead of a per-element Karatsuba
   multiply: ~2.8x on `mul_add`/`mul_assign`/`mul_into`. The scalar scatter,
