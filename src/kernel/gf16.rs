@@ -176,13 +176,15 @@ fn mul_into_scalar_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     }
 }
 
-/// AVX2 has enough width but not enough registers to retain several GF(2^16)
-/// four-table coefficient sets. Blocking a gather cannot help there in any
+/// Repeated AXPY, used where blocking a GF(2^16) gather does not pay.
+///
+/// AVX2 has enough width but not enough registers to retain several
+/// four-table coefficient sets, and a gather has nothing to share in any
 /// case: coefficients are one-to-one with sources, so a source's nibble split
-/// feeds exactly one coefficient and there is nothing to share. Measured
-/// 0.84–1.01x against repeated AVX2 AXPY across 2–16 sources and 4–64 KiB
-/// rows, so AXPY stays wired. SSSE3's smaller table vectors, by contrast,
-/// block profitably (1.5–1.8x) and are wired to the blocked kernel.
+/// feeds exactly one coefficient. It measured at parity or behind repeated
+/// AXPY, so AXPY stays wired. SSSE3's smaller table vectors do block
+/// profitably and are wired to the blocked kernel. See "Crossover and
+/// dispatch decisions" in BENCHMARKS.md.
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
 fn gather_avx2_axpy(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     for (&coeff, &src) in coeffs.iter().zip(srcs) {
@@ -190,12 +192,14 @@ fn gather_avx2_axpy(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     }
 }
 
+/// Repeated AXPY, used where blocking a GF(2^16) matrix does not pay.
+///
 /// The blocked AVX2 matrix folds every term into a register-resident
 /// destination tile, which should beat re-reading the destination per term.
-/// It does not, quite: measured 0.95–1.20x against repeated AVX2 AXPY, a win
-/// only for rows at or below ~8 KiB and parity or slightly behind at 16–64
-/// KiB. Not enough to justify a row-length branch in dispatch, so AXPY stays
-/// wired; revisit if the tile ever widens past two accumulators.
+/// It does not, quite: it wins on short rows and sits at parity or slightly
+/// behind on long ones, which is not enough to justify a row-length branch in
+/// dispatch (BENCHMARKS.md). Revisit if the tile ever widens past two
+/// accumulators.
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
 fn matrix_avx2_axpy(rows: &mut [u8], row_len: usize, terms: &[(&[Elem], &[u8])]) {
     for &(coeffs, src) in terms {
@@ -212,7 +216,7 @@ impl FieldKernels for Gf16 {
         match backend() {
             Backend::Avx512 | Backend::Gfni => Prepared::Compact(TowerCoeff::new(coeff)),
             // PMULL is table-free, so the broadcast-word form looks like the
-            // natural fit here. It is not: measured 0.26x against these four
+            // natural fit here. It is not: it measured far behind these four
             // nibble tables (see `aarch64::gf16`), so PMULL hosts prepare and
             // shuffle exactly like baseline NEON.
             Backend::Avx2 | Backend::Ssse3 | Backend::Pmull | Backend::Neon | Backend::Simd128 => {
@@ -364,10 +368,10 @@ impl FieldKernels for Gf16 {
             Backend::Avx512 => x86::avx512::gf16_gather(dst, coeffs, srcs),
             // Blocked: the four-source group derives its broadcasts once and
             // keeps them live, so it reads the destination once per group
-            // instead of once per source. Measured 1.03–1.59x over repeated
-            // GFNI AXPY across 2–16 sources and 4–64 KiB rows; before the
-            // broadcasts were hoisted out of the byte loop the same kernel
-            // ran at 0.29–0.47x, which is why dispatch used to avoid it.
+            // instead of once per source. That hoist is what makes it beat
+            // repeated GFNI AXPY; with the broadcasts still inside the byte
+            // loop the same kernel lost badly, which is why dispatch used to
+            // avoid it. Numbers in BENCHMARKS.md.
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Gfni => x86::gf16::gather_gfni(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
@@ -476,11 +480,11 @@ impl FieldKernels for Gf16 {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Gfni => x86::gf16::elementwise_gfni(dst, a, b),
             // Unlike GF(2^8), the tower elementwise product does *not* prefer
-            // PMULL: the same three-multiply identity over `vmull_p8` measured
-            // 0.88–0.92x against these bit-serial rounds on a Snapdragon 8
-            // Gen 3, so that kernel was removed rather than wired. (gf8
-            // elementwise, where PMULL replaces eight bit-serial rounds with
-            // two multiplies, is 1.55x — see `Gf8::mul_elementwise`.)
+            // PMULL: the same three-multiply identity over `vmull_p8`
+            // measured behind these bit-serial rounds, so that kernel was
+            // removed rather than wired. GF(2^8) elementwise, where PMULL
+            // replaces eight bit-serial rounds with two multiplies, does win
+            // — see `Gf8::mul_elementwise` and BENCHMARKS.md.
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
             Backend::Neon | Backend::Pmull => aarch64::gf16::elementwise_neon(dst, a, b),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]

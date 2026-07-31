@@ -1271,9 +1271,8 @@ mod aarch64 {
         }
         check_gf8_elementwise("gf8 pmull elementwise", aarch64::gf8::elementwise_pmull);
         // The tower elementwise and every fixed-coefficient PMULL kernel were
-        // measured against the nibble/bit-serial paths and lost (0.88x and
-        // 0.13–0.26x); GF(2^8) elementwise is the shape that won and the only
-        // one dispatch selects.
+        // measured against the nibble/bit-serial paths and lost; GF(2^8)
+        // elementwise is the shape that won and the only one dispatch selects.
     }
 
     #[test]

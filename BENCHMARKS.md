@@ -179,6 +179,100 @@ result is inside Node's noise band. A two-lane unroll of the *GF(2^8)* wasm
 kernels measured 1.00x and was therefore not kept: two swizzles per lane leave
 no latency to hide, unlike GF(2^16)'s eight.
 
+## Crossover and dispatch decisions
+
+Several kernels are wired one way rather than another because of a
+measurement. The code at each site states the decision and the reason; the
+numbers behind it are here, so that re-deriving them is a matter of rerunning
+a benchmark rather than trusting a comment.
+
+Unless noted otherwise: Core Ultra 7 258V, Linux, rustc 1.93, one core,
+maximum of interleaved runs with an unaffected operation as a 1.00x control.
+
+### Non-temporal stores in `mul_into` (`kernel::x86::NT_STORE_MIN`)
+
+`mul_into` never reads its destination, so an ordinary store pays a
+read-for-ownership fetch of every line it fully overwrites. `vmovntdq` skips
+it, at the price of evicting the destination. GF(2^8) `mul_into`, ordinary
+stores → non-temporal:
+
+| Destination | Write-only | Encode then read back |
+| --- | --- | --- |
+| 1 MiB | 32.3 → 61.2 GiB/s | 21.6 → 17.9 GiB/s |
+| 2 MiB | 21.3 → 66.0 | 16.5 → 16.9 |
+| 4 MiB | 21.5 → 37.8 | 14.5 → 16.1 |
+| 16 MiB | 16.1 → 34.4 | 10.7 → 12.9 |
+| 64 MiB | 14.2 → 23.0 | — |
+
+2 MiB (this host's L3 is 12 MiB) is where the read-back workload stops losing
+while the write-only one is already ~3x, which is why the threshold sits
+there. The forced `avx2` and `ssse3` arms hit the same ~14 GiB/s ceiling at
+16 MiB, so every backend is store-bound at that size, not multiply-bound.
+`mul_assign` reads its destination anyway and measures 22.0 GiB/s either way
+at 64 MiB, 0.5x at 256 KiB — it keeps ordinary stores.
+
+**Not taken:** GF(2^16) on SSSE3. Eight `PSHUFB` per 16 bytes hold that loop
+to ~5.9 GiB/s, well under the host's write bandwidth, and 16-byte
+non-temporal stores from a slow loop flush write-combining buffers before a
+line fills: 5.41/5.44 GiB/s ordinary against 4.84/4.79 non-temporal at
+32 MiB. The GF(2^8) SSSE3 kernel does reach the ceiling (19.7 GiB/s) and does
+use them.
+
+### Destination alignment peel (`kernel::x86::peel_to_align`)
+
+A 32-byte `vmovdqu` at an odd multiple of 32 straddles two cache lines, and a
+multi-row body issues one load and one store per row per vector. On GF(2^8)
+64 KiB rows the aligned form runs ~1.4x the misaligned one. Peeling at most
+31 bytes per row group buys the aligned body for the rest of the pass. The
+2 KiB floor comes from the original all-scalar GF(2^8) peel, which won from
+about 2 KiB up and lost badly below 1 KiB.
+
+Generalized to the GF(2^16) scatter kernels, normalized against untouched
+GF(2^8) rows as a control, 8 rows, misaligned destination:
+
+| Kernel | 64 KiB rows | 256 KiB rows |
+| --- | --- | --- |
+| gf16 scatter, GFNI | 1.30–1.36x | 1.23–1.30x |
+| gf16 scatter, AVX2 | 1.03–1.11x | 1.03–1.11x |
+
+An already-aligned destination is unchanged.
+
+**Not taken:** the GF(2^16) matrix kernel (0.96–1.03x at 64 KiB, 0.93–1.01x
+at 256 KiB — its row tile is stored once per term block, not per source
+window) and the SSSE3 scatter (1–3% slower; 16-byte accesses never straddle a
+line at the alignment allocators already give).
+
+### Blocking against repeated AXPY
+
+Register-blocked multi-row kernels are not universally better than dispatching
+to repeated single-row AXPY, so dispatch picks per `(field, backend, shape)`.
+Across 2–16 sources and 4–64 KiB rows, blocked against AXPY:
+
+| Shape | Result | Wired to |
+| --- | --- | --- |
+| gf16 gather, GFNI | 1.03–1.59x | blocked |
+| gf16 gather, SSSE3 | 1.5–1.8x | blocked |
+| gf16 gather, AVX2 | 0.84–1.01x | AXPY |
+| gf16 matrix, AVX2 | 0.95–1.20x | AXPY |
+| gf8 matrix, AVX2 | +20% | blocked |
+
+AVX2 loses on GF(2^16) because it has enough width but not enough registers to
+retain several four-table coefficient sets, and because a gather's
+coefficients are one-to-one with its sources — a source's nibble split feeds
+exactly one coefficient, so there is nothing to share. SSSE3's smaller table
+vectors fit. The AVX2 matrix wins only at or below ~8 KiB rows, which is not
+enough to justify a row-length branch in dispatch. Before its broadcasts were
+hoisted out of the byte loop, the GFNI gather ran at 0.29–0.47x, which is why
+dispatch previously avoided it.
+
+### Zero-coefficient skipping in the blocked GF(2^8) matrix kernel
+
+Not done: coefficients have to reach a general-purpose register to be tested,
+which stops each factor broadcast from folding into a memory-operand
+`vpbroadcastb`. Over eight terms and 64 KiB rows the check cost ~9%. Sparsity
+is handled in the scatter shape instead, which drops zero rows before grouping
+and outside any loop.
+
 ## Comparative benchmark
 
 `benches/compare.rs` compares compatible GF(2^8) operations against

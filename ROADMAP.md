@@ -16,7 +16,7 @@ as part of the current contract.
   makes the capability a cached, overridable dispatch choice. An AES/PMULL
   capable CI runner would keep that coverage without a device attached. Using
   PMULL for *fixed*-coefficient kernels is a closed question, not a gap: it
-  measured 0.13–0.26x against the nibble shuffle (BENCHMARKS.md).
+  measured far behind the nibble shuffle (BENCHMARKS.md).
 - Add fuzz targets for public row geometry (`row_len`, `nrows`, source count,
   coefficient count) and packed element boundaries.
 - Keep scalar/no-default-feature paths under Miri. Intrinsics themselves are

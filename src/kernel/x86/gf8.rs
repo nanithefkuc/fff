@@ -757,9 +757,9 @@ unsafe fn scatter_span<'a>(
 /// so testing it where it would have to live — innermost, once per tile — is
 /// pure overhead on a dense matrix, and it costs more than the branch: the
 /// coefficients have to reach a GPR to be tested, which stops each factor
-/// broadcast folding into a memory-operand `vpbroadcastb`. Measured on eight
-/// terms over 64 KiB rows the check cost ~9%. Sparsity belongs in the scatter
-/// shape, which drops zero rows before grouping and outside any loop.
+/// broadcast folding into a memory-operand `vpbroadcastb` (BENCHMARKS.md).
+/// Sparsity belongs in the scatter shape, which drops zero rows before
+/// grouping and outside any loop.
 ///
 /// # Panics
 /// Panics unless `rows` holds `nrows` rows of `row_len` bytes and every term

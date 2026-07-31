@@ -125,8 +125,8 @@ impl FieldKernels for Gf8 {
             Backend::Avx2 => x86::gf8::mul_add_avx2(dst, coeff, src),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Ssse3 => x86::gf8::mul_add_ssse3(dst, coeff, src),
-            // PMULL is table-free but 7x slower than the nibble shuffle for a
-            // fixed coefficient; measured, see `aarch64::gf8`.
+            // PMULL is table-free but far slower than the nibble shuffle for
+            // a fixed coefficient; see `aarch64::gf8` and BENCHMARKS.md.
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
             Backend::Neon | Backend::Pmull => aarch64::gf8::mul_add_neon(dst, coeff, src),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
@@ -297,8 +297,8 @@ impl FieldKernels for Gf8 {
             Backend::Gfni => x86::gf8::elementwise_gfni(dst, a, b),
             // Two varying operands are the one shape PMULL wins: two
             // `vmull_p8`s and a reduction network against eight bit-serial
-            // rounds, measured 1.55x at every size on a Snapdragon 8 Gen 3.
-            // The capability is cached in the backend, not probed per call.
+            // rounds. The capability is cached in the backend, not probed per
+            // call.
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
             Backend::Pmull => aarch64::gf8::elementwise_pmull(dst, a, b),
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]

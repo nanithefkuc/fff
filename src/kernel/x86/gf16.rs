@@ -26,8 +26,8 @@
 //! AXPY; AVX2 uses repeated AXPY for both. A GF(2^16) coefficient costs four
 //! nibble tables or two broadcast words, so how many of them can stay
 //! resident is what decides whether blocking beats re-reading the
-//! destination — see the measured crossover notes on the `kernel::gf16`
-//! dispatch arms before rewiring any of these.
+//! destination — see the crossover notes on the `kernel::gf16` dispatch arms,
+//! and BENCHMARKS.md, before rewiring any of these.
 
 use crate::field::gf16::Elem;
 use crate::kernel::Matrix;
@@ -751,12 +751,10 @@ unsafe fn mul_assign_ssse3_impl(dst: &mut [u8], tables: &TowerTables) {
 ///
 /// Unlike the GFNI and AVX2 forms this keeps ordinary stores at every size.
 /// Non-temporal stores only pay when the loop is store-bound, and this one is
-/// not: eight `PSHUFB` per 16 bytes hold it to ~5.9 GiB/s, well under the
-/// host's write bandwidth. Measured on a Core Ultra 7 258V, one core,
-/// `FFF_BACKEND=ssse3`, 32 MiB: 5.41/5.44 GiB/s with ordinary stores against
-/// 4.84/4.79 with `vmovntdq`, because 16-byte non-temporal stores from a slow
-/// loop flush write-combining buffers before a line fills. The GF(2^8) SSSE3
-/// kernel does reach the ceiling (19.7 GiB/s) and does use them.
+/// not: eight `PSHUFB` per 16 bytes hold it well under the host's write
+/// bandwidth, and 16-byte non-temporal stores from a slow loop flush
+/// write-combining buffers before a line fills. The GF(2^8) SSSE3 kernel does
+/// reach the ceiling and does use them. See BENCHMARKS.md.
 pub fn mul_into_ssse3(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the SSSE3 backend; `dst` and `src` are
@@ -986,10 +984,8 @@ unsafe fn matrix_gfni_impl<M: Matrix<Elem> + ?Sized>(
 /// there because a scatter loads and stores every row once per 32-byte source
 /// window; here the row tile is loaded and stored once per *term block*, so a
 /// straddling access is amortized over eight multiplies and the loop is
-/// compute-bound at ~85 GiB/s of logical traffic. Measured (Core Ultra 7 258V,
-/// one core, 8 terms, best of five interleaved runs, destinations at both
-/// 32-byte offsets 0 and 16): 64 KiB rows 0.96–1.03x, 256 KiB rows 0.93–1.01x
-/// — noise at best, and the same peel is worth 1.4–1.7x for the scatter.
+/// compute-bound rather than traffic-bound. Adding the peel here measured as
+/// noise at best (BENCHMARKS.md).
 ///
 /// # Safety
 /// AVX2 and GFNI must be available, the `N` rows at `base + k * stride` must
@@ -1627,9 +1623,7 @@ unsafe fn scatter_avx2_impl<C: TableCoefficient>(
 /// No destination alignment peel, unlike [`scatter_avx2`]. A 16-byte access
 /// only straddles a cache line when it is not 16-byte aligned, and every
 /// allocator this runs behind already returns 16-byte-aligned memory, so the
-/// peel has nothing to fix: measured (Core Ultra 7 258V, one core,
-/// `FFF_BACKEND=ssse3`, 64 KiB and 256 KiB rows, destinations at 32-byte
-/// offsets 0 and 16) it costs 1–3%.
+/// peel has nothing to fix and measured as a small loss (BENCHMARKS.md).
 pub fn scatter_ssse3<C: TableCoefficient>(
     rows: &mut [u8],
     row_len: usize,

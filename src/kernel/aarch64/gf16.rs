@@ -178,8 +178,8 @@ unsafe fn mul_add_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     let (dst_ptr, src_ptr) = (dst.as_mut_ptr(), src.as_ptr());
     let mut offset = 0;
     // Two independent lanes per iteration: eight table lookups per lane have
-    // enough latency to hide the other lane's loads and nibble splits behind.
-    // Measured +11% from 256 B to 8 MiB on a pinned big core (BENCHMARKS.md).
+    // enough latency to hide the other lane's loads and nibble splits behind
+    // (BENCHMARKS.md).
     while offset + 32 <= span {
         // SAFETY: `offset + 32 <= span <= min(dst.len(), src.len())`.
         unsafe {
@@ -659,11 +659,11 @@ fn multiply_base_vectors(mut a: uint8x16_t, mut b: uint8x16_t) -> uint8x16_t {
 
 // The tower form of the same identity over `PMULL` — two period-2 broadcasts
 // (`[c0, c0+c1]` on the block, `[DELTA*c1, c1]` on its adjacent-byte swap),
-// no nibble tables at all — was written and measured at **0.26x** against the
-// four-shuffle kernels above, at every row length from 16 B to 64 KiB. Cheap
-// preparation only paid below 32-byte rows, and only for one-shot calls
-// (1.5x at 16 B), which is not worth carrying a second prepared form for.
-// See the note in `super::gf8` for the instruction-count reason.
+// no nibble tables at all — was written and measured far behind the
+// four-shuffle kernels above at every row length. Cheap preparation only paid
+// on rows below one vector, and only for one-shot calls, which is not worth
+// carrying a second prepared form for. See the note in `super::gf8` for the
+// instruction-count reason, and BENCHMARKS.md for the numbers.
 
 /// `dst[i] = a[i] * b[i]` over interleaved tower elements.
 pub fn elementwise_neon(dst: &mut [u8], a: &[u8], b: &[u8]) {

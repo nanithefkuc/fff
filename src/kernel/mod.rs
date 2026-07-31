@@ -108,8 +108,8 @@ pub enum Backend {
     /// `AArch64` NEON + PMULL. Everything [`Backend::Neon`] does, plus
     /// `PMULL` for the one shape it wins: a varying operand pair, where the
     /// alternative is eight bit-serial rounds. Fixed coefficients still use
-    /// the nibble shuffle — PMULL's reduction network measured 4–7x slower
-    /// there. Detecting the extension once, here, is what keeps
+    /// the nibble shuffle, which PMULL's reduction network cannot match.
+    /// Detecting the extension once, here, is what keeps
     /// [`FieldKernels::mul_elementwise`] from probing it per call.
     Pmull,
     /// `AArch64` NEON split-nibble shuffle over 16-byte lanes.

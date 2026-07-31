@@ -39,18 +39,13 @@ use crate::kernel::scalar;
 /// completely. `vmovntdq` skips that fetch and the allocation, at the price
 /// of evicting the destination from cache.
 ///
-/// Measured on a Core Ultra 7 258V (12 MiB L3), one core, gf8 `mul_into`
-/// stock vs. non-temporal: 1 MiB 32.3 → 61.2 GiB/s, 2 MiB 21.3 → 66.0,
-/// 4 MiB 21.5 → 37.8, 16 MiB 16.1 → 34.4, 64 MiB 14.2 → 23.0. The forced
-/// `avx2` and `ssse3` arms sit at the same ~14 GiB/s ceiling at 16 MiB, so
-/// every backend is store-bound there, not multiply-bound.
-///
-/// The threshold guards the workload this pessimizes — encode, then read the
-/// destination back. Timing both in one loop, non-temporal stores lose only
-/// while the destination fits a cache that would have kept it: 1 MiB
-/// 21.6 → 17.9 GiB/s, but 2 MiB 16.5 → 16.9, 4 MiB 14.5 → 16.1, 16 MiB
-/// 10.7 → 12.9. 2 MiB is where the read-back case stops losing and the
-/// write-only case is already 3x.
+/// The threshold is set by the workload this pessimizes — encode, then read
+/// the destination back — because that is the case where the eviction costs
+/// something. Below it the read-back loop loses; at 2 MiB it breaks even while
+/// the write-only case is already several times ahead. `mul_add` and
+/// `mul_assign` read their destination anyway and keep ordinary stores. The
+/// measurements are under "Crossover and dispatch decisions" in
+/// BENCHMARKS.md.
 pub(super) const NT_STORE_MIN: usize = 2 << 20;
 
 /// Head bytes to store normally so that a non-temporal body starts on a
@@ -74,12 +69,13 @@ pub(super) fn nt_split(dst: &[u8], elem_bytes: usize) -> Option<usize> {
 /// A 32-byte `vmovdqu` at an odd multiple of 32 straddles two cache lines,
 /// and a multi-row body issues one load and one store per row per vector: a
 /// misaligned destination therefore doubles the line traffic of every access
-/// but the shared source load. Measured on GF(2^8) 64 KiB rows the aligned
-/// form runs ~1.4x the misaligned one, so peeling at most 31 bytes per row
-/// buys the aligned body for the rest of the pass. Rows of a group sit
-/// `row_len` apart, so aligning one aligns them all whenever `row_len` is a
-/// multiple of 32 — the usual case. The source is left where it falls: it is
-/// one access against many, and only the destination is ours to choose.
+/// but the shared source load. Peeling at most 31 bytes per row group buys
+/// the aligned body for the rest of the pass; the measurements, and the
+/// shapes where the same peel was tried and rejected, are in BENCHMARKS.md.
+/// Rows of a group sit `row_len` apart, so aligning one aligns them all
+/// whenever `row_len` is a multiple of 32 — the usual case. The source is
+/// left where it falls: it is one access against many, and only the
+/// destination is ours to choose.
 ///
 /// The peel is rounded up to a whole number of `elem_bytes` elements, because
 /// a kernel may only split a buffer on an element boundary. For an odd

@@ -679,12 +679,11 @@ pub(super) fn multiply_vectors_pmull(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t
 // Why there is no fixed-coefficient `PMULL` kernel here.
 //
 // A broadcast coefficient makes PMULL table-free, which looks attractive next
-// to a `ScaleTable`. It was written and measured (Snapdragon 8 Gen 3, one
-// pinned big core, `FFF_BACKEND=pmull` against `neon` in one binary): **0.13x**
-// for gf8 `mul_add`/`mul_assign` at every size from 4 KiB to 8 MiB, and 0.26x
-// for the GF(2^16) tower form. The arithmetic explains it — two `vmull_p8`s
-// plus a twenty-instruction reduction network per 16 bytes against
-// `vqtbl1q_u8`'s five — and no core makes PMULL fast enough to close a 7x gap.
+// to a `ScaleTable`. It was written, measured, and lost by a wide margin at
+// every size, for both GF(2^8) and the GF(2^16) tower form (BENCHMARKS.md).
+// The arithmetic explains it — two `vmull_p8`s plus a twenty-instruction
+// reduction network per 16 bytes against `vqtbl1q_u8`'s five — and no core
+// makes PMULL fast enough to close a gap that large.
 // The only shape where that reduction is cheaper than the alternative is a
 // *varying* operand pair, where the alternative is eight bit-serial rounds:
 // hence `elementwise_pmull` below, and nothing else.
