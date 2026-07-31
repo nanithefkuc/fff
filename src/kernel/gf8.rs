@@ -176,11 +176,7 @@ impl FieldKernels for Gf8 {
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
             Backend::Neon => aarch64::gf8::scatter_neon(rows, row_len, coeffs, src),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
-            Backend::Simd128 => {
-                for (row, &coeff) in rows.chunks_exact_mut(row_len).zip(coeffs) {
-                    wasm32::gf8::mul_add_simd128(row, scale_table(coeff), src);
-                }
-            }
+            Backend::Simd128 => wasm32::gf8::scatter_simd128(rows, row_len, coeffs, src),
             _ => scalar::mul_add_scatter::<Self>(rows, row_len, coeffs, src),
         }
     }
@@ -207,11 +203,7 @@ impl FieldKernels for Gf8 {
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
             Backend::Neon => aarch64::gf8::gather_neon(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
-            Backend::Simd128 => {
-                for (&coeff, &src) in coeffs.iter().zip(srcs) {
-                    wasm32::gf8::mul_add_simd128(dst, scale_table(coeff), src);
-                }
-            }
+            Backend::Simd128 => wasm32::gf8::gather_simd128(dst, coeffs, srcs),
             _ => scalar::mul_add_gather::<Self>(dst, coeffs, srcs),
         }
     }
@@ -237,7 +229,7 @@ impl FieldKernels for Gf8 {
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
             Backend::Neon => aarch64::gf8::matrix_neon(rows, row_len, nrows, terms),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
-            Backend::Simd128 => scalar::mul_add_matrix::<Self>(rows, row_len, nrows, terms),
+            Backend::Simd128 => wasm32::gf8::matrix_simd128(rows, row_len, nrows, terms),
             _ => scalar::mul_add_matrix::<Self>(rows, row_len, nrows, terms),
         }
     }

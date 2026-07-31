@@ -25,7 +25,9 @@ internals = []
 
 [dependencies]
 
-[dev-dependencies]
+# Comparison benchmarks only; the C `simd-accel` path has no wasm sysroot, and
+# scoping it here keeps `cargo test --target wasm32-*` buildable.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
 
 [profile.bench]

@@ -16,6 +16,16 @@ All notable changes to this project are documented here. The format follows
 - `internals` feature exposing the kernel modules and preparation types
   (`ScaleTable`, `TowerCoeff`, `TowerTables`, backend-specific SIMD entry
   points) for downstream libraries that build directly on the kernels.
+- wasm32 `simd128` GF(2^8) multi-row kernels: register-blocked
+  `mul_add_scatter`, `mul_add_gather`, and `mul_add_matrix`, with
+  zero/one coefficient specialization. `mul_add_matrix` no longer falls back
+  to the scalar kernel on wasm.
+
+### Fixed
+
+- wasm32 `simd128` test build, which referenced GF(2^8) scatter/gather/matrix
+  kernels that did not exist. The comparison dev-dependency is now scoped to
+  non-wasm targets so `cargo test --target wasm32-*` builds.
 
 ## [0.1.1] - 2026-07-29
 
