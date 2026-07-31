@@ -284,6 +284,46 @@ fn bench_blocked_vs_axpy() {
     println!();
 }
 
+/// Destination sizes straddling the non-temporal store threshold
+/// (`x86::NT_STORE_MIN`, 2 MiB): one below it as a control, two above.
+const LARGE_DST_LENGTHS: &[usize] = &[1 << 20, 8 << 20, 32 << 20];
+
+/// `mul_into` over destinations large enough for the store policy to matter.
+///
+/// `mul_into` never reads its destination, so an ordinary store still fetches
+/// every line it overwrites. Past 2 MiB the x86 kernels switch to `vmovntdq`,
+/// which skips that fetch and does not keep the destination cached. The
+/// read-back row is the workload that trade pessimizes: encode, then consume
+/// the result immediately. `mul_add` is the control — it reads its
+/// destination, so it is unaffected either way.
+fn bench_large_destination() {
+    println!("large destinations — mul_into store policy:");
+    for &len in LARGE_DST_LENGTHS {
+        let src = noise(len, 0xd00);
+        let mut dst = noise(len, 0xd01);
+        let mib = len / (1024 * 1024);
+
+        bench(&format!("{mib:3} MiB mul_into          gf8"), len, || {
+            ops::mul_into::<Gf8>(black_box(&mut dst), gf8::Elem(0x53), black_box(&src));
+        });
+        bench(&format!("{mib:3} MiB mul_into         gf16"), len, || {
+            ops::mul_into::<Gf16>(black_box(&mut dst), gf16::Elem(0x53a7), black_box(&src));
+        });
+        bench(&format!("{mib:3} MiB mul_into+read     gf8"), len, || {
+            ops::mul_into::<Gf8>(black_box(&mut dst), gf8::Elem(0x53), black_box(&src));
+            let mut acc = 0u64;
+            for word in dst.chunks_exact(8) {
+                acc ^= u64::from_le_bytes(word.try_into().unwrap());
+            }
+            black_box(acc);
+        });
+        bench(&format!("{mib:3} MiB mul_add           gf8"), len, || {
+            ops::mul_add::<Gf8>(black_box(&mut dst), gf8::Elem(0x53), black_box(&src));
+        });
+    }
+    println!();
+}
+
 /// Row lengths where a GF(2^16) coefficient's four nibble tables are a
 /// visible share of the work, plus one length where they are not.
 const SMALL_ROW_LENGTHS: &[usize] = &[64, 256, 1_024, 16_384];
@@ -367,6 +407,7 @@ fn main() {
 
     bench_preparation_crossover();
     bench_small_row_shapes();
+    bench_large_destination();
     #[cfg(all(
         feature = "internals",
         any(target_arch = "x86", target_arch = "x86_64")

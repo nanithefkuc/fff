@@ -106,6 +106,15 @@ with a coefficient set that is one-fifth zeros and one-fifth ones so the
 zero/one specializations are exercised. It also times fused `mul_into` against
 the copy-then-scale it replaces.
 
+`bench_large_destination` measures `mul_into` at 1, 8 and 32 MiB. Past 2 MiB
+the x86 kernels store the destination non-temporally, which skips the
+read-for-ownership fetch of lines they overwrite whole; the cost is that the
+destination is not left cached, so the section also times an
+encode-then-read-back loop, and `mul_add` as a control the change cannot touch.
+Rerun it before moving that threshold, and pin the process: the effect is
+entirely memory-side, so an unpinned run on a hybrid CPU reports the wrong
+size at which it starts paying.
+
 ## aarch64 and wasm32 kernel numbers (2026-07-31)
 
 Snapdragon 8 Gen 3 (`arm64-v8a`, Android, rustc 1.93, backend `neon`), one big

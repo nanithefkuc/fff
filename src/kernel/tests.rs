@@ -1053,6 +1053,92 @@ mod x86 {
             assert_eq!(sse2, want, "sse2 xor: len {len}");
         }
     }
+
+    /// `mul_into` over a buffer past the non-temporal store threshold.
+    ///
+    /// The shared `LENGTHS` are all far below it, so nothing else reaches the
+    /// `vmovntdq` body. Destination offsets 0 and 1 cover both sides of the
+    /// alignment peel — offset 1 leaves the GF(2^16) peel an odd number of
+    /// bytes, which must fall back to ordinary stores rather than split a
+    /// buffer mid-element.
+    #[test]
+    fn non_temporal_mul_into_matches_reference() {
+        const NT_LEN: usize = (2 << 20) + 130;
+        // The non-temporal split is a store-side choice, independent of the
+        // coefficient, so a zero, a one and a mixed value are enough.
+        const GF8_COEFFS: [gf8::Elem; 3] = [gf8::Elem(0), gf8::Elem(1), gf8::Elem(0x53)];
+        const GF16_COEFFS: [gf16::Elem; 3] = [gf16::Elem(0), gf16::Elem(1), gf16::Elem(0x53a7)];
+
+        let source = noise(NT_LEN + 2, 0x1a7);
+        for offset in [0, 1] {
+            let src = &source[offset..offset + NT_LEN];
+            let mut got = vec![0u8; NT_LEN + 1];
+
+            for coeff in GF8_COEFFS {
+                let table = scale_table(coeff);
+                let mut want = src.to_vec();
+                scalar::mul_assign::<gf8::Gf8>(&mut want, coeff);
+                if std::is_x86_feature_detected!("gfni") && std::is_x86_feature_detected!("avx2") {
+                    let got = &mut got[offset..offset + NT_LEN];
+                    x86::gf8::mul_into_gfni(got, coeff, src);
+                    assert_eq!(
+                        got,
+                        want.as_slice(),
+                        "gf8 gfni nt mul_into: coeff {coeff:?}"
+                    );
+                }
+                if std::is_x86_feature_detected!("avx2") {
+                    let got = &mut got[offset..offset + NT_LEN];
+                    x86::gf8::mul_into_avx2(got, table, src);
+                    assert_eq!(
+                        got,
+                        want.as_slice(),
+                        "gf8 avx2 nt mul_into: coeff {coeff:?}"
+                    );
+                }
+                let got = &mut got[offset..offset + NT_LEN];
+                x86::gf8::mul_into_ssse3(got, table, src);
+                assert_eq!(
+                    got,
+                    want.as_slice(),
+                    "gf8 ssse3 nt mul_into: coeff {coeff:?}"
+                );
+            }
+
+            // GF(2^16) needs an even length and an even peel.
+            let src = &src[..NT_LEN - 1];
+            for coeff in GF16_COEFFS {
+                let tables = TowerTables::new(coeff);
+                let mut want = src.to_vec();
+                scalar::mul_assign::<gf16::Gf16>(&mut want, coeff);
+                if std::is_x86_feature_detected!("gfni") && std::is_x86_feature_detected!("avx2") {
+                    let got = &mut got[offset..offset + src.len()];
+                    x86::gf16::mul_into_gfni(got, TowerCoeff::new(coeff), src);
+                    assert_eq!(
+                        got,
+                        want.as_slice(),
+                        "gf16 gfni nt mul_into: coeff {coeff:?}"
+                    );
+                }
+                if std::is_x86_feature_detected!("avx2") {
+                    let got = &mut got[offset..offset + src.len()];
+                    x86::gf16::mul_into_avx2(got, &tables, src);
+                    assert_eq!(
+                        got,
+                        want.as_slice(),
+                        "gf16 avx2 nt mul_into: coeff {coeff:?}"
+                    );
+                }
+                let got = &mut got[offset..offset + src.len()];
+                x86::gf16::mul_into_ssse3(got, &tables, src);
+                assert_eq!(
+                    got,
+                    want.as_slice(),
+                    "gf16 ssse3 nt mul_into: coeff {coeff:?}"
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

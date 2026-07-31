@@ -297,14 +297,27 @@ unsafe fn mul_assign_gfni_impl(dst: &mut [u8], coeff: TowerCoeff) {
 pub fn mul_into_gfni(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the GFNI backend, so AVX2 and GFNI are
-    // present; `dst` and `src` are separately borrowed slices.
-    unsafe { mul_into_gfni_impl(dst, coeff, src) }
+    // present; `dst` and `src` are separately borrowed slices, and `nt_split`
+    // returns an element-aligned, 32-byte-aligned split for the non-temporal
+    // body.
+    unsafe {
+        match super::nt_split(dst, 2) {
+            Some(peel) => {
+                let (head, body) = dst.split_at_mut(peel);
+                let (src_head, src_body) = src.split_at(peel);
+                mul_into_gfni_impl::<false>(head, coeff, src_head);
+                mul_into_gfni_impl::<true>(body, coeff, src_body);
+                _mm_sfence();
+            }
+            None => mul_into_gfni_impl::<false>(dst, coeff, src),
+        }
+    }
 }
 
 /// # Safety
 /// AVX2 and GFNI must be available on the host.
 #[target_feature(enable = "avx2,gfni")]
-unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
+unsafe fn mul_into_gfni_impl<const NT: bool>(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
     let len = dst.len().min(src.len());
     let (same_word, cross_word) = broadcast_words(coeff);
     let same = _mm256_set1_epi16(same_word);
@@ -327,10 +340,10 @@ unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
             let p1 = scale_gfni(x1, _mm256_shuffle_epi8(x1, swap), same, cross);
             let p2 = scale_gfni(x2, _mm256_shuffle_epi8(x2, swap), same, cross);
             let p3 = scale_gfni(x3, _mm256_shuffle_epi8(x3, swap), same, cross);
-            _mm256_storeu_si256(dp.cast(), p0);
-            _mm256_storeu_si256(dp.add(32).cast(), p1);
-            _mm256_storeu_si256(dp.add(64).cast(), p2);
-            _mm256_storeu_si256(dp.add(96).cast(), p3);
+            super::store256::<NT>(dp, p0);
+            super::store256::<NT>(dp.add(32), p1);
+            super::store256::<NT>(dp.add(64), p2);
+            super::store256::<NT>(dp.add(96), p3);
         }
         offset += 128;
     }
@@ -546,14 +559,26 @@ unsafe fn mul_assign_avx2_impl(dst: &mut [u8], tables: &TowerTables) {
 pub fn mul_into_avx2(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the AVX2 backend; `dst` and `src` are
-    // separately borrowed slices.
-    unsafe { mul_into_avx2_impl(dst, tables, src) }
+    // separately borrowed slices, and `nt_split` returns an element-aligned,
+    // 32-byte-aligned split for the non-temporal body.
+    unsafe {
+        match super::nt_split(dst, 2) {
+            Some(peel) => {
+                let (head, body) = dst.split_at_mut(peel);
+                let (src_head, src_body) = src.split_at(peel);
+                mul_into_avx2_impl::<false>(head, tables, src_head);
+                mul_into_avx2_impl::<true>(body, tables, src_body);
+                _mm_sfence();
+            }
+            None => mul_into_avx2_impl::<false>(dst, tables, src),
+        }
+    }
 }
 
 /// # Safety
 /// AVX2 must be available on the host.
 #[target_feature(enable = "avx2")]
-unsafe fn mul_into_avx2_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
+unsafe fn mul_into_avx2_impl<const NT: bool>(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     let len = dst.len().min(src.len());
     let vectors = nibble_avx2(tables);
     let (dst_ptr, src_ptr) = (dst.as_mut_ptr(), src.as_ptr());
@@ -563,7 +588,7 @@ unsafe fn mul_into_avx2_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
         // SAFETY: `offset + 32 <= len <= dst.len().min(src.len())`.
         unsafe {
             let x = _mm256_loadu_si256(src_ptr.add(offset).cast());
-            _mm256_storeu_si256(dst_ptr.add(offset).cast(), scale_avx2(x, &vectors));
+            super::store256::<NT>(dst_ptr.add(offset), scale_avx2(x, &vectors));
         }
         offset += 32;
     }
@@ -723,6 +748,15 @@ unsafe fn mul_assign_ssse3_impl(dst: &mut [u8], tables: &TowerTables) {
 ///
 /// Fused form of copy-then-scale: the `mul_add` body without the destination
 /// read, one pass.
+///
+/// Unlike the GFNI and AVX2 forms this keeps ordinary stores at every size.
+/// Non-temporal stores only pay when the loop is store-bound, and this one is
+/// not: eight `PSHUFB` per 16 bytes hold it to ~5.9 GiB/s, well under the
+/// host's write bandwidth. Measured on a Core Ultra 7 258V, one core,
+/// `FFF_BACKEND=ssse3`, 32 MiB: 5.41/5.44 GiB/s with ordinary stores against
+/// 4.84/4.79 with `vmovntdq`, because 16-byte non-temporal stores from a slow
+/// loop flush write-combining buffers before a line fills. The GF(2^8) SSSE3
+/// kernel does reach the ceiling (19.7 GiB/s) and does use them.
 pub fn mul_into_ssse3(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the SSSE3 backend; `dst` and `src` are

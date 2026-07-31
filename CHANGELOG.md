@@ -36,6 +36,22 @@ All notable changes to this project are documented here. The format follows
   32-byte destination tile in registers across a block of eight sources, and
   `matrix` keeps a four-row tile across a block of eight terms. Rows ≥ 256 B:
   scatter ~2.1x, gather ~1.7x, matrix 1.3–1.6x under Node/V8.
+- Non-temporal stores (`vmovntdq`) in the x86 `mul_into` kernels once the
+  destination reaches 2 MiB: GF(2^8) on GFNI/AVX2/SSSE3 and GF(2^16) on
+  GFNI/AVX2. `mul_into` never reads its destination, so an ordinary store still
+  fetches every line it overwrites. Core Ultra 7 258V, Linux, rustc 1.93, one
+  core, 8 MiB / 32 MiB: gf8 18.8 → 33.2 and 13.6 → 22.6 GiB/s (gfni),
+  18.2 → 33.9 and 13.1 → 17.8 (avx2), 19.7 → 32.5 and 13.3 → 16.6 (ssse3);
+  gf16 18.1 → 32.9 and 12.5 → 20.5 (gfni), 16.5 → 20.9 and 11.3 → 12.5 (avx2).
+  Destinations below 2 MiB, `mul_add`, and `mul_assign` are unchanged: the
+  threshold is where an encode-then-read-back loop stops losing from the
+  eviction, and `mul_assign` reads its destination anyway (measured 22.0 GiB/s
+  either way at 64 MiB, 0.5x at 256 KiB). GF(2^16) on SSSE3 keeps ordinary
+  stores: at ~5.9 GiB/s it is shuffle-bound, and non-temporal stores cost it
+  11%.
+- `bench_large_destination` in `benches/kernels.rs`: `mul_into` at 1/8/32 MiB
+  with an encode-then-read-back row and `mul_add` as the unaffected control —
+  the shapes the non-temporal store threshold is set from.
 - `bench_small_row_shapes` in `benches/kernels.rs`: GF(2^16) multi-row shapes at
   preparation-dominated row lengths, plus fused `mul_into` against
   copy-then-scale. `BENCHMARKS.md` documents the aarch64 (adb/cargo-ndk) and

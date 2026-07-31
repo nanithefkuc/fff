@@ -150,12 +150,24 @@ unsafe fn mul_assign_gfni_impl(dst: &mut [u8], coeff: Elem) {
 pub fn mul_into_gfni(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the GFNI backend, which detected both AVX2
-    // and GFNI; the slices are equal-length and independently borrowed.
-    unsafe { mul_into_gfni_impl(dst, coeff, src) }
+    // and GFNI; the slices are equal-length and independently borrowed, and
+    // `nt_split` returns a 32-byte-aligned split for the non-temporal body.
+    unsafe {
+        match super::nt_split(dst, 1) {
+            Some(peel) => {
+                let (head, body) = dst.split_at_mut(peel);
+                let (src_head, src_body) = src.split_at(peel);
+                mul_into_gfni_impl::<false>(head, coeff, src_head);
+                mul_into_gfni_impl::<true>(body, coeff, src_body);
+                _mm_sfence();
+            }
+            None => mul_into_gfni_impl::<false>(dst, coeff, src),
+        }
+    }
 }
 
 #[target_feature(enable = "avx2,gfni")]
-unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
+unsafe fn mul_into_gfni_impl<const NT: bool>(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     let factor = _mm256_set1_epi8(coeff.0.cast_signed());
     let factor128 = _mm256_castsi256_si128(factor);
     let len = dst.len();
@@ -174,10 +186,10 @@ unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
             let r1 = _mm256_gf2p8mul_epi8(_mm256_loadu_si256(sp.add(32).cast()), factor);
             let r2 = _mm256_gf2p8mul_epi8(_mm256_loadu_si256(sp.add(64).cast()), factor);
             let r3 = _mm256_gf2p8mul_epi8(_mm256_loadu_si256(sp.add(96).cast()), factor);
-            _mm256_storeu_si256(dp.cast(), r0);
-            _mm256_storeu_si256(dp.add(32).cast(), r1);
-            _mm256_storeu_si256(dp.add(64).cast(), r2);
-            _mm256_storeu_si256(dp.add(96).cast(), r3);
+            super::store256::<NT>(dp, r0);
+            super::store256::<NT>(dp.add(32), r1);
+            super::store256::<NT>(dp.add(64), r2);
+            super::store256::<NT>(dp.add(96), r3);
         }
         offset += 128;
     }
@@ -299,12 +311,24 @@ unsafe fn mul_add_ssse3_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
 pub fn mul_into_avx2(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the AVX2 backend; the slices are
-    // equal-length and independently borrowed.
-    unsafe { mul_into_avx2_impl(dst, table, src) }
+    // equal-length and independently borrowed, and `nt_split` returns a
+    // 32-byte-aligned split for the non-temporal body.
+    unsafe {
+        match super::nt_split(dst, 1) {
+            Some(peel) => {
+                let (head, body) = dst.split_at_mut(peel);
+                let (src_head, src_body) = src.split_at(peel);
+                mul_into_avx2_impl::<false>(head, table, src_head);
+                mul_into_avx2_impl::<true>(body, table, src_body);
+                _mm_sfence();
+            }
+            None => mul_into_avx2_impl::<false>(dst, table, src),
+        }
+    }
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn mul_into_avx2_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+unsafe fn mul_into_avx2_impl<const NT: bool>(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     // SAFETY: `lo` and `hi` are 16-byte arrays, exactly one `__m128i` each.
     let (lo_tbl, hi_tbl) = unsafe {
         (
@@ -323,13 +347,13 @@ unsafe fn mul_into_avx2_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
             let x = _mm256_loadu_si256(src_ptr.add(offset).cast());
             let lo = _mm256_shuffle_epi8(lo_tbl, _mm256_and_si256(x, mask));
             let hi = _mm256_shuffle_epi8(hi_tbl, _mm256_and_si256(_mm256_srli_epi16::<4>(x), mask));
-            _mm256_storeu_si256(dst_ptr.add(offset).cast(), _mm256_xor_si256(lo, hi));
+            super::store256::<NT>(dst_ptr.add(offset), _mm256_xor_si256(lo, hi));
         }
         offset += 32;
     }
 
     // SAFETY: AVX2 implies SSSE3, and the remainders keep equal lengths.
-    unsafe { mul_into_ssse3_impl(&mut dst[len..], table, &src[len..]) }
+    unsafe { mul_into_ssse3_impl::<false>(&mut dst[len..], table, &src[len..]) }
 }
 
 /// `dst = coeff * dst` by nibble shuffle over 32-byte lanes.
@@ -412,13 +436,26 @@ unsafe fn mul_assign_ssse3_impl(dst: &mut [u8], table: &ScaleTable) {
 pub fn mul_into_ssse3(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the SSSE3 backend; the slices are
-    // equal-length and independently borrowed.
-    unsafe { mul_into_ssse3_impl(dst, table, src) }
+    // equal-length and independently borrowed, and `nt_split` returns a
+    // 32-byte-aligned — hence 16-byte-aligned — split for the non-temporal
+    // body.
+    unsafe {
+        match super::nt_split(dst, 1) {
+            Some(peel) => {
+                let (head, body) = dst.split_at_mut(peel);
+                let (src_head, src_body) = src.split_at(peel);
+                mul_into_ssse3_impl::<false>(head, table, src_head);
+                mul_into_ssse3_impl::<true>(body, table, src_body);
+                _mm_sfence();
+            }
+            None => mul_into_ssse3_impl::<false>(dst, table, src),
+        }
+    }
 }
 
 #[inline]
 #[target_feature(enable = "ssse3")]
-unsafe fn mul_into_ssse3_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+unsafe fn mul_into_ssse3_impl<const NT: bool>(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     // SAFETY: `lo` and `hi` are 16-byte arrays, exactly one `__m128i` each.
     let (lo_tbl, hi_tbl) = unsafe {
         (
@@ -437,7 +474,7 @@ unsafe fn mul_into_ssse3_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
             let x = _mm_loadu_si128(src_ptr.add(offset).cast());
             let lo = _mm_shuffle_epi8(lo_tbl, _mm_and_si128(x, mask));
             let hi = _mm_shuffle_epi8(hi_tbl, _mm_and_si128(_mm_srli_epi16::<4>(x), mask));
-            _mm_storeu_si128(dst_ptr.add(offset).cast(), _mm_xor_si128(lo, hi));
+            super::store128::<NT>(dst_ptr.add(offset), _mm_xor_si128(lo, hi));
         }
         offset += 16;
     }
