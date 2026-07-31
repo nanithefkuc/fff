@@ -324,6 +324,59 @@ fn bench_large_destination() {
     println!();
 }
 
+/// Multi-row scatter with the destination at each 32-byte residue.
+///
+/// A 32-byte access at an odd multiple of 32 touches two cache lines, and a
+/// scatter loads and stores every row of a group once per source window, so
+/// the destination side is where that doubles. The GFNI and AVX2 kernels peel
+/// up to 31 bytes per row group to align the rest of the pass; the skew rows
+/// below are what set that policy, and an allocator-fresh buffer alone will
+/// not show it because its residue is fixed.
+fn bench_destination_alignment() {
+    println!("destination alignment — multi-row scatter:");
+    let nrows = 8;
+    for &row_len in &[64 * 1024usize, 256 * 1024] {
+        let src = noise(row_len, 0xe00);
+        let coeffs8: Vec<_> = (0..nrows)
+            .map(|j| gf8::Elem((j as u8).wrapping_mul(37).wrapping_add(2)))
+            .collect();
+        let coeffs16: Vec<_> = (0..nrows)
+            .map(|j| gf16::Elem((j as u16).wrapping_mul(9871).wrapping_add(2)))
+            .collect();
+        let mut backing = noise(row_len * nrows + 32, 0xe01);
+        let kib = row_len / 1024;
+        for skew in [0usize, 16] {
+            let rows = &mut backing[skew..skew + row_len * nrows];
+            let traffic = row_len * nrows;
+            bench(
+                &format!("{kib:4} KiB rows, skew {skew:2}   gf8"),
+                traffic,
+                || {
+                    ops::mul_add_scatter::<Gf8>(
+                        black_box(rows),
+                        row_len,
+                        &coeffs8,
+                        black_box(&src),
+                    );
+                },
+            );
+            bench(
+                &format!("{kib:4} KiB rows, skew {skew:2}  gf16"),
+                traffic,
+                || {
+                    ops::mul_add_scatter::<Gf16>(
+                        black_box(rows),
+                        row_len,
+                        &coeffs16,
+                        black_box(&src),
+                    );
+                },
+            );
+        }
+    }
+    println!();
+}
+
 /// Row lengths where a GF(2^16) coefficient's four nibble tables are a
 /// visible share of the work, plus one length where they are not.
 const SMALL_ROW_LENGTHS: &[usize] = &[64, 256, 1_024, 16_384];
@@ -408,6 +461,7 @@ fn main() {
     bench_preparation_crossover();
     bench_small_row_shapes();
     bench_large_destination();
+    bench_destination_alignment();
     #[cfg(all(
         feature = "internals",
         any(target_arch = "x86", target_arch = "x86_64")

@@ -554,33 +554,6 @@ unsafe fn scatter_gfni_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], sr
     }
 }
 
-/// Bytes of scalar lead-in that put a row group's vector accesses on a
-/// 32-byte boundary, or `0` when the row is too short to repay it.
-///
-/// A 32-byte `vmovdqu` at an odd multiple of 32 straddles two cache lines,
-/// and the scatter body issues one load and one store per row per vector: a
-/// misaligned destination therefore doubles the line traffic of eight of the
-/// nine accesses a four-row group makes at each vector position. Measured on
-/// 64 KiB rows the aligned form runs ~1.4x the misaligned one, so peeling at
-/// most 31 bytes per row buys the aligned body for the rest of the pass.
-/// Rows of a group sit `row_len` apart, so aligning one aligns them all
-/// whenever `row_len` is a multiple of 32 — the usual case. The source is
-/// left where it falls: it is the one access against eight, and only the
-/// destination is ours to choose.
-#[inline]
-fn peel_to_align(ptr: *const u8, len: usize) -> usize {
-    // The peel uses 128-bit GFNI where possible and scalar code below one XMM
-    // lane. Keep the conservative crossover measured for the former all-scalar
-    // peel: it won from about 2 KiB up and lost badly below 1 KiB. Sixteen
-    // turns of the 128-byte body remains the floor.
-    const FLOOR: usize = 16 * 128;
-    let head = ptr.align_offset(32);
-    // `align_offset` reports `usize::MAX` only for an unreachable alignment,
-    // which cannot happen for a byte pointer; `head >= len` also covers the
-    // degenerate case of a peel longer than the row.
-    if len < FLOOR || head >= len { 0 } else { head }
-}
-
 /// `rows[i] ^= coeffs[i] * src` for four disjoint rows of `src.len()` bytes.
 #[target_feature(enable = "avx2,gfni")]
 unsafe fn scatter_rows4(ptrs: [*mut u8; 4], coeffs: [Elem; 4], src: &[u8]) {
@@ -595,7 +568,7 @@ unsafe fn scatter_rows4(ptrs: [*mut u8; 4], coeffs: [Elem; 4], src: &[u8]) {
 
     // Bring the destinations to a 32-byte boundary before the vector body
     // starts; see `peel_to_align`.
-    let head = peel_to_align(ptrs[0], len);
+    let head = super::peel_to_align(ptrs[0], len, 1);
     // SAFETY: `head <= len`, the length shared by `src` and every row, so
     // `0..head` is a sub-range of each; the four rows are distinct and
     // in-bounds, and no slice into them is live here.
@@ -665,7 +638,7 @@ unsafe fn scatter_rows2(ptrs: [*mut u8; 2], coeffs: [Elem; 2], src: &[u8]) {
 
     // As in `scatter_rows4`, with four of every five accesses on the
     // destination side.
-    let head = peel_to_align(ptrs[0], len);
+    let head = super::peel_to_align(ptrs[0], len, 1);
     // SAFETY: `head <= len`, the length shared by `src` and both rows, so
     // `0..head` is a sub-range of each; the rows are distinct, in-bounds,
     // and no slice into them is live here.

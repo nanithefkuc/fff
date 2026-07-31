@@ -68,6 +68,41 @@ pub(super) fn nt_split(dst: &[u8], elem_bytes: usize) -> Option<usize> {
     (peel != usize::MAX && peel.is_multiple_of(elem_bytes)).then_some(peel)
 }
 
+/// Bytes of lead-in that put a row group's vector accesses on a 32-byte
+/// boundary, or `0` when the row is too short to repay it.
+///
+/// A 32-byte `vmovdqu` at an odd multiple of 32 straddles two cache lines,
+/// and a multi-row body issues one load and one store per row per vector: a
+/// misaligned destination therefore doubles the line traffic of every access
+/// but the shared source load. Measured on GF(2^8) 64 KiB rows the aligned
+/// form runs ~1.4x the misaligned one, so peeling at most 31 bytes per row
+/// buys the aligned body for the rest of the pass. Rows of a group sit
+/// `row_len` apart, so aligning one aligns them all whenever `row_len` is a
+/// multiple of 32 — the usual case. The source is left where it falls: it is
+/// one access against many, and only the destination is ours to choose.
+///
+/// The peel is rounded up to a whole number of `elem_bytes` elements, because
+/// a kernel may only split a buffer on an element boundary. For an odd
+/// destination pointer in a 2-byte field that is unreachable, and the peel is
+/// skipped.
+#[inline]
+pub(super) fn peel_to_align(ptr: *const u8, len: usize, elem_bytes: usize) -> usize {
+    // The peel runs the narrow single-row kernels, which descend to 128-bit
+    // lanes and then scalar code. Keep the conservative crossover measured for
+    // the former all-scalar GF(2^8) peel: it won from about 2 KiB up and lost
+    // badly below 1 KiB. Sixteen turns of the 128-byte body remains the floor.
+    const FLOOR: usize = 16 * 128;
+    let head = ptr.align_offset(32);
+    // `align_offset` reports `usize::MAX` only for an unreachable alignment,
+    // which cannot happen for a byte pointer; `head >= len` also covers the
+    // degenerate case of a peel longer than the row.
+    if len < FLOOR || head >= len || !head.is_multiple_of(elem_bytes) {
+        0
+    } else {
+        head
+    }
+}
+
 /// Store 32 bytes, non-temporally when `NT`.
 ///
 /// # Safety

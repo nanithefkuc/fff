@@ -52,6 +52,22 @@ All notable changes to this project are documented here. The format follows
 - `bench_large_destination` in `benches/kernels.rs`: `mul_into` at 1/8/32 MiB
   with an encode-then-read-back row and `mul_add` as the unaffected control —
   the shapes the non-temporal store threshold is set from.
+- Destination alignment peel in the GF(2^16) multi-row scatter kernels (GFNI
+  and AVX2), generalizing the GF(2^8) scatter peel: up to 31 bytes per row
+  group run through the single-row kernel so the rest of the pass has 32-byte
+  aligned row accesses. `peel_to_align` moved to `kernel::x86` and takes an
+  element width, since a GF(2^16) buffer may only be split on an even byte.
+  Core Ultra 7 258V, Linux, rustc 1.93, one core, 8 rows, misaligned
+  destination, normalized against the untouched GF(2^8) rows as a control:
+  64 KiB rows 1.30–1.36x and 256 KiB rows 1.23–1.30x (gfni), 1.03–1.11x
+  (avx2); an already-aligned destination is unchanged. Not taken for the
+  GF(2^16) matrix kernel (0.93–1.03x: its row tile is stored once per term
+  block, not per source window) or the SSSE3 scatter (1–3% slower: 16-byte
+  accesses never straddle a line at the alignment allocators already give).
+  Both rejections are recorded in code with their numbers.
+- `bench_destination_alignment` in `benches/kernels.rs`: multi-row scatter with
+  the destination at 32-byte residues 0 and 16, the shape the peel policy is
+  set from.
 - `bench_small_row_shapes` in `benches/kernels.rs`: GF(2^16) multi-row shapes at
   preparation-dominated row lengths, plus fused `mul_into` against
   copy-then-scale. `BENCHMARKS.md` documents the aarch64 (adb/cargo-ndk) and

@@ -115,6 +115,13 @@ Rerun it before moving that threshold, and pin the process: the effect is
 entirely memory-side, so an unpinned run on a hybrid CPU reports the wrong
 size at which it starts paying.
 
+`bench_destination_alignment` measures multi-row scatter with the destination
+at 32-byte residues 0 and 16. The GFNI and AVX2 kernels peel a row group's
+lead-in so the rest of the pass is aligned; a single allocator-fresh buffer
+cannot show that effect, because its residue never varies. Read the two skews
+against each other, and keep an unchanged field (GF(2^8) here, when only the
+GF(2^16) kernels changed) as a drift control.
+
 ## aarch64 and wasm32 kernel numbers (2026-07-31)
 
 Snapdragon 8 Gen 3 (`arm64-v8a`, Android, rustc 1.93, backend `neon`), one big

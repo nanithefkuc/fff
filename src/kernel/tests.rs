@@ -1139,6 +1139,66 @@ mod x86 {
             }
         }
     }
+
+    /// Multi-row scatter over rows long enough to take the alignment peel.
+    ///
+    /// `ROW_LENS` tops out at 300 bytes, below the peel's row-length floor, so
+    /// no other test reaches the peeled path. The destination is offset by
+    /// every residue that matters: 0 and 16 pick different peel lengths, and 1
+    /// makes a 32-byte boundary unreachable in whole GF(2^16) elements, which
+    /// must skip the peel rather than split an element.
+    #[test]
+    fn aligned_scatter_matches_reference() {
+        const ROW_LEN: usize = 4096;
+
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("gfni")) {
+            eprintln!("skipping: no AVX2+GFNI on this host");
+            return;
+        }
+        for nrows in [1usize, 4, 6, 9] {
+            for skew in [0usize, 1, 16] {
+                let src = noise(ROW_LEN, 0x1b8);
+                let mut backing = noise(ROW_LEN * nrows + skew, 0x1c9);
+                let rows = &mut backing[skew..];
+
+                let coeffs8: Vec<_> = (0..nrows).map(gf8_coeff_at).collect();
+                let mut want = rows.to_vec();
+                x86::gf8::scatter_gfni(rows, ROW_LEN, &coeffs8, &src);
+                for (row, &coeff) in want.chunks_exact_mut(ROW_LEN).zip(&coeffs8) {
+                    gf8_reference(row, coeff, &src);
+                }
+                assert_eq!(rows, want.as_slice(), "gf8 peeled scatter: {nrows}/{skew}");
+
+                let coeffs16: Vec<_> = (0..nrows).map(gf16_coeff_at).collect();
+                let mut want = rows.to_vec();
+                x86::gf16::scatter_gfni(rows, ROW_LEN, &coeffs16, &src);
+                for (row, &coeff) in want.chunks_exact_mut(ROW_LEN).zip(&coeffs16) {
+                    gf16_reference(row, coeff, &src);
+                }
+                assert_eq!(rows, want.as_slice(), "gf16 peeled scatter: {nrows}/{skew}");
+
+                for (name, kernel) in [
+                    (
+                        "avx2",
+                        x86::gf16::scatter_avx2::<gf16::Elem>
+                            as fn(&mut [u8], usize, &[gf16::Elem], &[u8]),
+                    ),
+                    ("ssse3", x86::gf16::scatter_ssse3::<gf16::Elem>),
+                ] {
+                    let mut want = rows.to_vec();
+                    kernel(rows, ROW_LEN, &coeffs16, &src);
+                    for (row, &coeff) in want.chunks_exact_mut(ROW_LEN).zip(&coeffs16) {
+                        gf16_reference(row, coeff, &src);
+                    }
+                    assert_eq!(
+                        rows,
+                        want.as_slice(),
+                        "gf16 {name} peeled scatter: {nrows}/{skew}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

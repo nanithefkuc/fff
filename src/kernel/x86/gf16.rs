@@ -878,7 +878,17 @@ unsafe fn scatter_group_gfni<const N: usize>(
     }
 
     let src_ptr = src.as_ptr();
-    let mut offset = 0;
+    // Bring the destinations to a 32-byte boundary; see `peel_to_align`.
+    let head = super::peel_to_align(rows[0], span, 2);
+    for (k, &coeff) in coeffs.iter().enumerate() {
+        // SAFETY: `head <= span`, so `0..head` lies inside every row, and the
+        // peel is a whole number of elements.
+        unsafe {
+            let lead = core::slice::from_raw_parts_mut(rows[k], head);
+            mul_add_gfni_impl(lead, TowerCoeff::new(coeff), &src[..head]);
+        }
+    }
+    let mut offset = head;
     while offset + 32 <= span {
         // SAFETY: `offset + 32 <= span <= src.len()` bounds the source load.
         let x = unsafe { _mm256_loadu_si256(src_ptr.add(offset).cast()) };
@@ -972,6 +982,15 @@ unsafe fn matrix_gfni_impl<M: Matrix<Elem> + ?Sized>(
 /// Fold every term into `N` consecutive rows starting at `base`, which is row
 /// `first` of the destination.
 ///
+/// No destination alignment peel, unlike [`scatter_group_gfni`]. The peel pays
+/// there because a scatter loads and stores every row once per 32-byte source
+/// window; here the row tile is loaded and stored once per *term block*, so a
+/// straddling access is amortized over eight multiplies and the loop is
+/// compute-bound at ~85 GiB/s of logical traffic. Measured (Core Ultra 7 258V,
+/// one core, 8 terms, best of five interleaved runs, destinations at both
+/// 32-byte offsets 0 and 16): 64 KiB rows 0.96–1.03x, 256 KiB rows 0.93–1.01x
+/// — noise at best, and the same peel is worth 1.4–1.7x for the scatter.
+///
 /// # Safety
 /// AVX2 and GFNI must be available, the `N` rows at `base + k * stride` must
 /// be readable and writable for `span` bytes, every term must supply more
@@ -1004,7 +1023,6 @@ unsafe fn matrix_group_gfni<const N: usize, M: Matrix<Elem> + ?Sized>(
                 *slot = broadcast_words(TowerCoeff::new(coeff));
             }
         }
-
         let mut offset = 0;
         while offset + 32 <= span {
             let mut acc = [_mm256_setzero_si256(); N];
@@ -1553,15 +1571,27 @@ unsafe fn scatter_avx2_impl<C: TableCoefficient>(
     if row_len == 0 {
         return;
     }
-    let vector_len = row_len & !31;
     let base = rows.as_mut_ptr();
     for group in (0..coeffs.len()).step_by(4) {
         let count = (coeffs.len() - group).min(4);
         let vectors: [NibbleAvx2; 4] = core::array::from_fn(|i| {
             coeffs[group + i.min(count - 1)].with_tables(|tables| nibble_avx2(tables))
         });
-        let mut offset = 0;
-        while offset < vector_len {
+        // Bring this group's rows to a 32-byte boundary; see `peel_to_align`.
+        // SAFETY: row `group` is in bounds, and `head <= row_len`.
+        let head = unsafe { super::peel_to_align(base.add(group * row_len), row_len, 2) };
+        for slot in 0..count {
+            // SAFETY: `head` bytes from the start of row `group + slot`, which
+            // is in bounds, and the peel is a whole number of elements.
+            unsafe {
+                let lead =
+                    core::slice::from_raw_parts_mut(base.add((group + slot) * row_len), head);
+                coeffs[group + slot]
+                    .with_tables(|tables| mul_add_avx2_impl(lead, tables, &src[..head]));
+            }
+        }
+        let mut offset = head;
+        while offset + 32 <= row_len {
             // SAFETY: this source window is in bounds.
             let source = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast()) };
             for (slot, vector) in vectors.iter().take(count).enumerate() {
@@ -1583,16 +1613,23 @@ unsafe fn scatter_avx2_impl<C: TableCoefficient>(
             // SAFETY: this is one row's disjoint scalar tail.
             let tail = unsafe {
                 core::slice::from_raw_parts_mut(
-                    base.add((group + slot) * row_len + vector_len),
-                    row_len - vector_len,
+                    base.add((group + slot) * row_len + offset),
+                    row_len - offset,
                 )
             };
-            mul_add_scalar(tail, coeffs[group + slot].coefficient(), &src[vector_len..]);
+            mul_add_scalar(tail, coeffs[group + slot].coefficient(), &src[offset..]);
         }
     }
 }
 
 /// One source into many rows using four SSSE3 table sets at a time.
+///
+/// No destination alignment peel, unlike [`scatter_avx2`]. A 16-byte access
+/// only straddles a cache line when it is not 16-byte aligned, and every
+/// allocator this runs behind already returns 16-byte-aligned memory, so the
+/// peel has nothing to fix: measured (Core Ultra 7 258V, one core,
+/// `FFF_BACKEND=ssse3`, 64 KiB and 256 KiB rows, destinations at 32-byte
+/// offsets 0 and 16) it costs 1–3%.
 pub fn scatter_ssse3<C: TableCoefficient>(
     rows: &mut [u8],
     row_len: usize,
@@ -1613,7 +1650,6 @@ unsafe fn scatter_ssse3_impl<C: TableCoefficient>(
     if row_len == 0 {
         return;
     }
-    let vector_len = row_len & !15;
     let base = rows.as_mut_ptr();
     for group in (0..coeffs.len()).step_by(4) {
         let count = (coeffs.len() - group).min(4);
@@ -1621,7 +1657,7 @@ unsafe fn scatter_ssse3_impl<C: TableCoefficient>(
             coeffs[group + i.min(count - 1)].with_tables(|tables| nibble_ssse3(tables))
         });
         let mut offset = 0;
-        while offset < vector_len {
+        while offset + 16 <= row_len {
             // SAFETY: this source window is in bounds.
             let source = unsafe { _mm_loadu_si128(src.as_ptr().add(offset).cast()) };
             for (slot, vector) in vectors.iter().take(count).enumerate() {
@@ -1640,11 +1676,11 @@ unsafe fn scatter_ssse3_impl<C: TableCoefficient>(
             // SAFETY: this is one row's disjoint scalar tail.
             let tail = unsafe {
                 core::slice::from_raw_parts_mut(
-                    base.add((group + slot) * row_len + vector_len),
-                    row_len - vector_len,
+                    base.add((group + slot) * row_len + offset),
+                    row_len - offset,
                 )
             };
-            mul_add_scalar(tail, coeffs[group + slot].coefficient(), &src[vector_len..]);
+            mul_add_scalar(tail, coeffs[group + slot].coefficient(), &src[offset..]);
         }
     }
 }
