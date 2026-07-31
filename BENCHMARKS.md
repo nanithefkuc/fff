@@ -37,6 +37,20 @@ the process-wide backend is `avx512` or `gfni`.
 Small GF(2^16) rows are sensitive to coefficient preparation because a shuffle
 backend builds four nibble tables per coefficient. Use `Coeff` or `Plan` when a
 coding matrix is reused. Large rows amortize the same setup in the byte loop.
+GF(2^8) preparation is free at every size — its 256-entry table bank is static
+— and GFNI preparation is two broadcast words, so the effect is a shuffle-
+backend GF(2^16) concern only.
+
+`bench_preparation_crossover` in `benches/kernels.rs` measures exactly where
+that stops mattering, one-shot against prepared over 16 B … 64 KiB rows. Run
+it rather than quoting a remembered threshold; on a hybrid CPU pin the process
+(`taskset -c <p-core>`) or the two core types will produce two answers.
+
+`bench_blocked_vs_axpy` measures the blocked multi-row GF(2^16) kernels
+against repeated single-row AXPY by calling both directly, bypassing dispatch.
+It needs the `internals` feature (`cargo bench --bench kernels --features
+internals`) and is the harness to rerun before changing which shape a backend
+dispatches to.
 
 ## Comparative benchmark
 

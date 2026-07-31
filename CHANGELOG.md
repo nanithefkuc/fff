@@ -20,6 +20,9 @@ All notable changes to this project are documented here. The format follows
   `mul_add_scatter`, `mul_add_gather`, and `mul_add_matrix`, with
   zero/one coefficient specialization. `mul_add_matrix` no longer falls back
   to the scalar kernel on wasm.
+- `bench_preparation_crossover` and `bench_blocked_vs_axpy` sections in
+  `benches/kernels.rs`; the latter needs the `internals` feature and measures
+  blocked multi-row kernels against repeated AXPY with dispatch bypassed.
 
 ### Changed
 
@@ -27,6 +30,13 @@ All notable changes to this project are documented here. The format follows
   through the shared nibble tables instead of a per-element Karatsuba
   multiply: ~2.8x on `mul_add`/`mul_assign`/`mul_into`. The scalar scatter,
   gather, and matrix fallbacks route through the same path.
+- GF(2^16) GFNI `mul_add_gather` now uses the blocked kernel, which derives
+  its broadcast factors once per four-source group instead of inside the byte
+  loop: measured 1.03–1.59x over the previous repeated-AXPY dispatch.
+- GF(2^8) AVX2 `mul_add_matrix` shares each source's nibble split across the
+  rows of a group and amortizes table broadcasts over a 64-byte tile: +20%.
+- GF(2^16) 256-bit kernels descend through one 128-bit vector before the
+  scalar tail, so sub-32-byte remainders are no longer fully scalar.
 
 ### Fixed
 

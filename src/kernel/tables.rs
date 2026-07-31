@@ -13,9 +13,11 @@
 //!
 //! The GF(2^8) table bank is shared and built once; all 256 coefficients cost
 //! 8 KiB and stay resident in L1/L2. GF(2^16) has 65536 coefficients, so a
-//! full bank would be ~9 MiB and thrash cache — those are derived per call
-//! instead, which costs at most 64 base multiplies and is amortized over the
-//! whole buffer.
+//! full bank would be ~9 MiB and thrash cache. A GF(2^16) coefficient is
+//! instead resolved per call into its four base-field factors (two base
+//! multiplies, [`TowerCoeff::new`]) and, on shuffle backends, four table
+//! copies out of the shared bank ([`TowerTables::new`]) — amortized over the
+//! whole buffer, or hoisted out entirely with `Coeff`/`Plan`.
 
 use crate::field::gf8;
 use crate::field::gf16;

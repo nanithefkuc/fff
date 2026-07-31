@@ -30,7 +30,10 @@ fn noise(len: usize, seed: u64) -> Vec<u8> {
 
 /// Run `body` until it has been timed enough times to trust the median, and
 /// report bytes per second over `bytes` of logical traffic per iteration.
-fn bench(label: &str, bytes: usize, mut body: impl FnMut()) {
+///
+/// Returns the median iteration time so callers can print a ratio between two
+/// shapes measured back to back in the same process.
+fn bench(label: &str, bytes: usize, mut body: impl FnMut()) -> Duration {
     // Warm caches, branch predictors, and the lazy backend detection.
     for _ in 0..16 {
         body();
@@ -51,6 +54,51 @@ fn bench(label: &str, bytes: usize, mut body: impl FnMut()) {
 
     let gib_per_sec = bytes as f64 / median.as_secs_f64() / (1024.0 * 1024.0 * 1024.0);
     println!("  {label:<44} {:>9.2?}  {gib_per_sec:>7.2} GiB/s", median);
+    median
+}
+
+/// Row lengths for the preparation crossover sweep: below one lane through
+/// well past the point where the byte loop dominates table derivation.
+const CROSSOVER_LENGTHS: &[usize] = &[
+    16, 32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 16_384, 65_536,
+];
+
+/// Where does preparing a coefficient stop paying for itself?
+///
+/// One-shot `mul_add` derives the backend's coefficient form on every call —
+/// two broadcast words on GFNI, four nibble tables on a shuffle backend. The
+/// `_with` form derives it once. The ratio printed here is the whole reason
+/// `Coeff`/`Plan` exist, and it is the number `BENCHMARKS.md` refers to.
+fn bench_preparation_crossover() {
+    println!("preparation crossover — one-shot vs prepared, by row length:");
+    for &len in CROSSOVER_LENGTHS {
+        let src = noise(len, 0xa00 + len as u64);
+        let mut dst = noise(len, 0xb00 + len as u64);
+        let coeff8 = gf8::Elem(0x53);
+        let coeff16 = gf16::Elem(0x53a7);
+        let prepared8 = ops::Coeff::<Gf8>::new(coeff8);
+        let prepared16 = ops::Coeff::<Gf16>::new(coeff16);
+
+        println!("  row {len} B:");
+        let one8 = bench("  mul_add one-shot           gf8", len, || {
+            ops::mul_add::<Gf8>(black_box(&mut dst), coeff8, black_box(&src));
+        });
+        let with8 = bench("  mul_add prepared           gf8", len, || {
+            ops::mul_add_with::<Gf8>(black_box(&mut dst), &prepared8, black_box(&src));
+        });
+        let one16 = bench("  mul_add one-shot          gf16", len, || {
+            ops::mul_add::<Gf16>(black_box(&mut dst), coeff16, black_box(&src));
+        });
+        let with16 = bench("  mul_add prepared          gf16", len, || {
+            ops::mul_add_with::<Gf16>(black_box(&mut dst), &prepared16, black_box(&src));
+        });
+        println!(
+            "    one-shot/prepared: gf8 {:.2}x  gf16 {:.2}x",
+            one8.as_secs_f64() / with8.as_secs_f64(),
+            one16.as_secs_f64() / with16.as_secs_f64()
+        );
+    }
+    println!();
 }
 
 /// Payload lengths used by network-facing consumers.
@@ -97,32 +145,152 @@ fn bench_network_payloads() {
     println!();
 }
 
+/// Blocked multi-row GF(2^16) kernels measured against repeated single-row
+/// AXPY, bypassing dispatch.
+///
+/// Dispatch currently selects AXPY for GFNI gather, AVX2 gather, and AVX2
+/// matrix (`src/kernel/gf16.rs:119-149`). That choice is a measurement, not a
+/// theory, so it needs a harness that can run both sides in one process:
+/// hence the `internals` feature and the direct kernel calls.
+#[cfg(all(
+    feature = "internals",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+fn bench_blocked_vs_axpy() {
+    use fff::kernel::tables::{TowerCoeff, TowerTables};
+    use fff::kernel::x86;
+
+    let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
+    let has_gfni = has_avx2 && std::arch::is_x86_feature_detected!("gfni");
+    let has_ssse3 = std::arch::is_x86_feature_detected!("ssse3");
+    if !has_ssse3 {
+        return;
+    }
+
+    println!("blocked vs AXPY — direct GF(2^16) kernel calls (dispatch bypassed):");
+    for &row_len in &[4 * 1024usize, 16 * 1024, 64 * 1024] {
+        for &nsrc in &[2usize, 4, 8, 16] {
+            let sources: Vec<Vec<u8>> = (0..nsrc)
+                .map(|t| noise(row_len, 0xc00 + t as u64))
+                .collect();
+            let srcs: Vec<&[u8]> = sources.iter().map(Vec::as_slice).collect();
+            let coeffs: Vec<gf16::Elem> = (0..nsrc)
+                .map(|t| gf16::Elem(((t * 7919) as u16).wrapping_add(3)))
+                .collect();
+            let mut dst = noise(row_len, 0xd00);
+            let traffic = row_len * nsrc;
+
+            println!("  gather {nsrc} sources x {} KiB:", row_len / 1024);
+            let blocked = bench("  gather blocked           ssse3", traffic, || {
+                x86::gf16::gather_ssse3(black_box(&mut dst), &coeffs, black_box(&srcs));
+            });
+            let axpy = bench("  gather AXPY              ssse3", traffic, || {
+                for (&coeff, &src) in coeffs.iter().zip(&srcs) {
+                    x86::gf16::mul_add_ssse3(
+                        black_box(&mut dst),
+                        &TowerTables::new(coeff),
+                        black_box(src),
+                    );
+                }
+            });
+            println!(
+                "    ssse3 blocked/AXPY: {:.2}x",
+                axpy.as_secs_f64() / blocked.as_secs_f64()
+            );
+
+            if has_avx2 {
+                let blocked = bench("  gather blocked            avx2", traffic, || {
+                    x86::gf16::gather_avx2(black_box(&mut dst), &coeffs, black_box(&srcs));
+                });
+                let axpy = bench("  gather AXPY               avx2", traffic, || {
+                    for (&coeff, &src) in coeffs.iter().zip(&srcs) {
+                        x86::gf16::mul_add_avx2(
+                            black_box(&mut dst),
+                            &TowerTables::new(coeff),
+                            black_box(src),
+                        );
+                    }
+                });
+                println!(
+                    "    avx2  blocked/AXPY: {:.2}x",
+                    axpy.as_secs_f64() / blocked.as_secs_f64()
+                );
+            }
+            if has_gfni {
+                let blocked = bench("  gather blocked            gfni", traffic, || {
+                    x86::gf16::gather_gfni(black_box(&mut dst), &coeffs, black_box(&srcs));
+                });
+                let axpy = bench("  gather AXPY               gfni", traffic, || {
+                    for (&coeff, &src) in coeffs.iter().zip(&srcs) {
+                        x86::gf16::mul_add_gfni(
+                            black_box(&mut dst),
+                            TowerCoeff::new(coeff),
+                            black_box(src),
+                        );
+                    }
+                });
+                println!(
+                    "    gfni  blocked/AXPY: {:.2}x",
+                    axpy.as_secs_f64() / blocked.as_secs_f64()
+                );
+            }
+
+            if !has_avx2 {
+                continue;
+            }
+            // Matrix: `nsrc` sources folded into 4 rows.
+            let nrows = 4;
+            let mut rows = noise(row_len * nrows, 0xe00);
+            let coeff_sets: Vec<Vec<gf16::Elem>> = (0..nsrc)
+                .map(|t| {
+                    (0..nrows)
+                        .map(|j| gf16::Elem(((t * 613 + j * 97) as u16).wrapping_add(1)))
+                        .collect()
+                })
+                .collect();
+            let terms: Vec<(&[gf16::Elem], &[u8])> = coeff_sets
+                .iter()
+                .zip(&sources)
+                .map(|(c, s)| (c.as_slice(), s.as_slice()))
+                .collect();
+            let traffic = row_len * nrows * nsrc;
+            println!(
+                "  matrix {nsrc} sources x {nrows} rows x {} KiB:",
+                row_len / 1024
+            );
+            let blocked = bench("  matrix blocked            avx2", traffic, || {
+                x86::gf16::matrix_avx2(black_box(&mut rows), row_len, nrows, &terms);
+            });
+            let axpy = bench("  matrix AXPY               avx2", traffic, || {
+                for &(coeffs, src) in &terms {
+                    for (row, &coeff) in rows.chunks_exact_mut(row_len).zip(coeffs) {
+                        x86::gf16::mul_add_avx2(
+                            black_box(row),
+                            &TowerTables::new(coeff),
+                            black_box(src),
+                        );
+                    }
+                }
+            });
+            println!(
+                "    avx2  blocked/AXPY: {:.2}x",
+                axpy.as_secs_f64() / blocked.as_secs_f64()
+            );
+        }
+    }
+    println!();
+}
+
 fn main() {
     println!("fff kernel benchmark — backend: {}", backend().name());
     println!("  (override with FFF_BACKEND=avx512|gfni|avx2|ssse3|neon|scalar)\n");
 
-    // Coefficient preparation matters only when the payload is short enough
-    // that four GF(2^16) table derivations are not hidden by the byte loop.
-    let short_src = noise(64, 0x600);
-    let mut short_dst = noise(64, 0x601);
-    let short_coeff = gf16::Elem(0x53a7);
-    let short_prepared = ops::Coeff::<Gf16>::new(short_coeff);
-    println!("coefficient preparation — 64-byte GF(2^16) rows:");
-    bench("mul_add one-shot", 64, || {
-        ops::mul_add::<Gf16>(
-            black_box(&mut short_dst),
-            short_coeff,
-            black_box(&short_src),
-        );
-    });
-    bench("mul_add prepared", 64, || {
-        ops::mul_add_with::<Gf16>(
-            black_box(&mut short_dst),
-            &short_prepared,
-            black_box(&short_src),
-        );
-    });
-    println!();
+    bench_preparation_crossover();
+    #[cfg(all(
+        feature = "internals",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    bench_blocked_vs_axpy();
 
     bench_network_payloads();
 

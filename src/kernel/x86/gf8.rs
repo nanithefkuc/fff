@@ -1521,7 +1521,6 @@ unsafe fn scatter_ssse3_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], s
 }
 
 /// Many sources into many rows using AVX2 nibble shuffles.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn matrix_avx2(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
     matrix_avx2_with(rows, row_len, nrows, terms);
 }
@@ -1537,7 +1536,6 @@ pub fn matrix_avx2_with<M: Matrix<Elem> + ?Sized>(
     unsafe { matrix_avx2_impl(rows, row_len, nrows, terms) }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "avx2")]
 unsafe fn matrix_avx2_impl<M: Matrix<Elem> + ?Sized>(
     rows: &mut [u8],
@@ -1549,50 +1547,21 @@ unsafe fn matrix_avx2_impl<M: Matrix<Elem> + ?Sized>(
         return;
     }
     let vector_len = row_len & !31;
+    let tile_len = row_len & !63;
     let base = rows.as_mut_ptr();
-    let mask = _mm256_set1_epi8(0x0f);
     let mut group = 0;
     while group < nrows {
         let count = (nrows - group).min(4);
-        let mut offset = 0;
-        while offset < vector_len {
-            let mut acc = [_mm256_setzero_si256(); 4];
-            // SAFETY: every selected row contains this 32-byte window.
-            unsafe {
-                for (slot, value) in acc.iter_mut().take(count).enumerate() {
-                    *value = _mm256_loadu_si256(base.add((group + slot) * row_len + offset).cast());
-                }
-            }
-            for term in 0..terms.len() {
-                let src = terms.source(term);
-                // SAFETY: every term source is exactly `row_len` bytes.
-                let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast()) };
-                for (slot, value) in acc.iter_mut().take(count).enumerate() {
-                    let table = scale_table(*terms.coefficient(term, group + slot));
-                    // SAFETY: each table half is exactly 16 bytes.
-                    unsafe {
-                        let lo =
-                            _mm256_broadcastsi128_si256(_mm_loadu_si128(table.lo.as_ptr().cast()));
-                        let hi =
-                            _mm256_broadcastsi128_si256(_mm_loadu_si128(table.hi.as_ptr().cast()));
-                        let product = _mm256_xor_si256(
-                            _mm256_shuffle_epi8(lo, _mm256_and_si256(x, mask)),
-                            _mm256_shuffle_epi8(
-                                hi,
-                                _mm256_and_si256(_mm256_srli_epi16::<4>(x), mask),
-                            ),
-                        );
-                        *value = _mm256_xor_si256(*value, product);
-                    }
-                }
-            }
-            // SAFETY: the same disjoint row windows loaded above.
-            unsafe {
-                for (slot, &value) in acc.iter().take(count).enumerate() {
-                    _mm256_storeu_si256(base.add((group + slot) * row_len + offset).cast(), value);
-                }
-            }
-            offset += 32;
+        // SAFETY: rows `group..group + count` start at `base + j * row_len`
+        // and span `row_len` bytes, which the wrapper checked lies inside
+        // `rows`; distinct rows are `row_len` apart, so the group is
+        // pairwise disjoint. `count` is at most four, and the wrapper checked
+        // every term for `nrows` coefficients over a `row_len`-byte source.
+        unsafe { matrix_tiles_avx2(base, row_len, group, count, tile_len, terms) }
+        // At most one 32-byte vector survives the 64-byte tile loop.
+        if tile_len < vector_len {
+            // SAFETY: as above, and `tile_len + 32 <= vector_len <= row_len`.
+            unsafe { matrix_vector_avx2(base, row_len, group, count, tile_len, terms) }
         }
         for slot in 0..count {
             // SAFETY: this is the selected row's disjoint tail, AVX2 implies
@@ -1613,8 +1582,159 @@ unsafe fn matrix_avx2_impl<M: Matrix<Elem> + ?Sized>(
     }
 }
 
+/// Fold every term into a group of up to four rows, 64 bytes of each row at
+/// a time.
+///
+/// Two accumulator vectors per row, matching the 64-byte tile of
+/// [`matrix_rows4`], so a coefficient's nibble tables are broadcast once per
+/// (tile, term) and shuffled twice. Lifting the broadcast clear of the tile
+/// loop the way [`scatter_avx2`] does is only possible there because a
+/// scatter has a single source, so four tables cover the whole row group; a
+/// matrix would need `4 * terms.len()` tables live at once, well past the
+/// register file. Deepening the tile is the reachable form of the same
+/// saving, and it cannot cost destination traffic: the tile still absorbs
+/// every term before it is stored.
+///
+/// A full four-row group is the one shape that does not fit the register
+/// file: eight accumulators, four nibble indices, a table pair and two
+/// shuffle temporaries need seventeen YMM registers, so the last row's two
+/// accumulators live on the stack. That still trades eight table broadcasts
+/// for two reloads and two stores per (tile, term), and the round trip sits
+/// off the critical path behind sixteen shuffles, so the tile is a net
+/// sixteen-to-twelve reduction in memory operations. Narrower groups stay
+/// entirely in registers.
+///
+/// # Safety
+/// Rows `group..group + count` must be in bounds from `base` at `row_len`
+/// bytes each, `count` must be at most four, `tile_len` must be
+/// `row_len & !63`, every term's source must be `row_len` bytes, and every
+/// term must supply coefficients through index `group + count - 1`.
+#[target_feature(enable = "avx2")]
+unsafe fn matrix_tiles_avx2<M: Matrix<Elem> + ?Sized>(
+    base: *mut u8,
+    row_len: usize,
+    group: usize,
+    count: usize,
+    tile_len: usize,
+    terms: &M,
+) {
+    let mask = _mm256_set1_epi8(0x0f);
+    let mut offset = 0;
+    while offset < tile_len {
+        let mut acc = [[_mm256_setzero_si256(); 2]; 4];
+        // SAFETY: every selected row contains this 64-byte window.
+        unsafe {
+            for (slot, value) in acc.iter_mut().take(count).enumerate() {
+                let ptr = base.add((group + slot) * row_len + offset);
+                value[0] = _mm256_loadu_si256(ptr.cast());
+                value[1] = _mm256_loadu_si256(ptr.add(32).cast());
+            }
+        }
+        for term in 0..terms.len() {
+            let src = terms.source(term);
+            // SAFETY: every term source is exactly `row_len` bytes.
+            let (x0, x1) = unsafe {
+                let sp = src.as_ptr().add(offset);
+                (
+                    _mm256_loadu_si256(sp.cast()),
+                    _mm256_loadu_si256(sp.add(32).cast()),
+                )
+            };
+            // Nibble indices depend on the source alone, so the whole row
+            // group shares them.
+            let indices = [
+                _mm256_and_si256(x0, mask),
+                _mm256_and_si256(_mm256_srli_epi16::<4>(x0), mask),
+                _mm256_and_si256(x1, mask),
+                _mm256_and_si256(_mm256_srli_epi16::<4>(x1), mask),
+            ];
+            for (slot, value) in acc.iter_mut().take(count).enumerate() {
+                let table = scale_table(*terms.coefficient(term, group + slot));
+                // SAFETY: each table half is exactly 16 bytes.
+                unsafe {
+                    let lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(table.lo.as_ptr().cast()));
+                    let hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(table.hi.as_ptr().cast()));
+                    value[0] = _mm256_xor_si256(
+                        value[0],
+                        _mm256_xor_si256(
+                            _mm256_shuffle_epi8(lo, indices[0]),
+                            _mm256_shuffle_epi8(hi, indices[1]),
+                        ),
+                    );
+                    value[1] = _mm256_xor_si256(
+                        value[1],
+                        _mm256_xor_si256(
+                            _mm256_shuffle_epi8(lo, indices[2]),
+                            _mm256_shuffle_epi8(hi, indices[3]),
+                        ),
+                    );
+                }
+            }
+        }
+        // SAFETY: the same disjoint row windows loaded above.
+        unsafe {
+            for (slot, value) in acc.iter().take(count).enumerate() {
+                let ptr = base.add((group + slot) * row_len + offset);
+                _mm256_storeu_si256(ptr.cast(), value[0]);
+                _mm256_storeu_si256(ptr.add(32).cast(), value[1]);
+            }
+        }
+        offset += 64;
+    }
+}
+
+/// Fold every term into one 32-byte window of a group of up to four rows.
+///
+/// # Safety
+/// As [`matrix_tiles_avx2`], with `offset + 32 <= row_len`.
+#[target_feature(enable = "avx2")]
+unsafe fn matrix_vector_avx2<M: Matrix<Elem> + ?Sized>(
+    base: *mut u8,
+    row_len: usize,
+    group: usize,
+    count: usize,
+    offset: usize,
+    terms: &M,
+) {
+    let mask = _mm256_set1_epi8(0x0f);
+    let mut acc = [_mm256_setzero_si256(); 4];
+    // SAFETY: every selected row contains this 32-byte window.
+    unsafe {
+        for (slot, value) in acc.iter_mut().take(count).enumerate() {
+            *value = _mm256_loadu_si256(base.add((group + slot) * row_len + offset).cast());
+        }
+    }
+    for term in 0..terms.len() {
+        let src = terms.source(term);
+        // SAFETY: every term source is exactly `row_len` bytes.
+        let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast()) };
+        let indices_lo = _mm256_and_si256(x, mask);
+        let indices_hi = _mm256_and_si256(_mm256_srli_epi16::<4>(x), mask);
+        for (slot, value) in acc.iter_mut().take(count).enumerate() {
+            let table = scale_table(*terms.coefficient(term, group + slot));
+            // SAFETY: each table half is exactly 16 bytes.
+            unsafe {
+                let lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(table.lo.as_ptr().cast()));
+                let hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(table.hi.as_ptr().cast()));
+                *value = _mm256_xor_si256(
+                    *value,
+                    _mm256_xor_si256(
+                        _mm256_shuffle_epi8(lo, indices_lo),
+                        _mm256_shuffle_epi8(hi, indices_hi),
+                    ),
+                );
+            }
+        }
+    }
+    // SAFETY: the same disjoint row windows loaded above.
+    unsafe {
+        for (slot, &value) in acc.iter().take(count).enumerate() {
+            _mm256_storeu_si256(base.add((group + slot) * row_len + offset).cast(), value);
+        }
+    }
+}
+
 /// Many sources into many rows using SSSE3 nibble shuffles.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn matrix_ssse3(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
     matrix_ssse3_with(rows, row_len, nrows, terms);
 }
@@ -1630,7 +1750,6 @@ pub fn matrix_ssse3_with<M: Matrix<Elem> + ?Sized>(
     unsafe { matrix_ssse3_impl(rows, row_len, nrows, terms) }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "ssse3")]
 unsafe fn matrix_ssse3_impl<M: Matrix<Elem> + ?Sized>(
     rows: &mut [u8],

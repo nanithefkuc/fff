@@ -60,9 +60,10 @@ impl Prepared {
 /// Deliberately not a [`TowerTables`]: that copies 136 bytes of table onto the
 /// stack, and the tail handlers below run on as little as a single two-byte
 /// element. Borrowing costs the two base multiplies of [`TowerCoeff::new`]
-/// plus four rodata indexes.
+/// plus four rodata indexes, so the blocked backend kernels resolve their
+/// coefficients through here too rather than duplicating the derivation.
 #[inline]
-fn factor_tables(coeff: Elem) -> [&'static ScaleTable; 4] {
+pub(crate) fn factor_tables(coeff: Elem) -> [&'static ScaleTable; 4] {
     let f = TowerCoeff::new(coeff).factors();
     [
         scale_table(f[0]),
@@ -175,22 +176,13 @@ fn mul_into_scalar_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     }
 }
 
-/// GFNI's compact factors are cheap to derive, but the generic blocked gather
-/// cannot keep a variable number of broadcasts live and measured 1.5–2.7x
-/// behind the four-chain single-coefficient kernel. Repeated GFNI AXPY is the
-/// measured crossover for this one shape.
-#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-fn gather_gfni_axpy(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
-    for (&coeff, &src) in coeffs.iter().zip(srcs) {
-        x86::gf16::mul_add_gfni(dst, TowerCoeff::new(coeff), src);
-    }
-}
-
-/// AVX2 has enough width but not enough registers to retain several
-/// GF(2^16) four-table coefficient sets: the blocked gather/matrix kernels
-/// spill and measured 3–25% behind repeated AVX2 AXPY. SSSE3's smaller table
-/// vectors, by contrast, win 1.4–1.5x. Use the measured crossover rather than
-/// forcing the nominally wider blocked kernel.
+/// AVX2 has enough width but not enough registers to retain several GF(2^16)
+/// four-table coefficient sets. Blocking a gather cannot help there in any
+/// case: coefficients are one-to-one with sources, so a source's nibble split
+/// feeds exactly one coefficient and there is nothing to share. Measured
+/// 0.84–1.01x against repeated AVX2 AXPY across 2–16 sources and 4–64 KiB
+/// rows, so AXPY stays wired. SSSE3's smaller table vectors, by contrast,
+/// block profitably (1.5–1.8x) and are wired to the blocked kernel.
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
 fn gather_avx2_axpy(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     for (&coeff, &src) in coeffs.iter().zip(srcs) {
@@ -198,6 +190,12 @@ fn gather_avx2_axpy(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     }
 }
 
+/// The blocked AVX2 matrix folds every term into a register-resident
+/// destination tile, which should beat re-reading the destination per term.
+/// It does not, quite: measured 0.95–1.20x against repeated AVX2 AXPY, a win
+/// only for rows at or below ~8 KiB and parity or slightly behind at 16–64
+/// KiB. Not enough to justify a row-length branch in dispatch, so AXPY stays
+/// wired; revisit if the tile ever widens past two accumulators.
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
 fn matrix_avx2_axpy(rows: &mut [u8], row_len: usize, terms: &[(&[Elem], &[u8])]) {
     for &(coeffs, src) in terms {
@@ -345,8 +343,14 @@ impl FieldKernels for Gf16 {
         match backend() {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Avx512 => x86::avx512::gf16_gather(dst, coeffs, srcs),
+            // Blocked: the four-source group derives its broadcasts once and
+            // keeps them live, so it reads the destination once per group
+            // instead of once per source. Measured 1.03–1.59x over repeated
+            // GFNI AXPY across 2–16 sources and 4–64 KiB rows; before the
+            // broadcasts were hoisted out of the byte loop the same kernel
+            // ran at 0.29–0.47x, which is why dispatch used to avoid it.
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Gfni => gather_gfni_axpy(dst, coeffs, srcs),
+            Backend::Gfni => x86::gf16::gather_gfni(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Avx2 => gather_avx2_axpy(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
