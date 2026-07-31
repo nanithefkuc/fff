@@ -26,12 +26,13 @@ implementation.
 - Revisit the measured crossover rules per `(field, backend, shape)`. A backend
   name alone cannot predict whether a particular operation is register-blocked.
 - GF(2^32)/GF(2^64) now have an x86 GFNI kernel (the tower identity one and two
-  levels above GF(2^16)); Fan–Paar GF(2^16) has an x86 AVX2/SSSE3 kernel (the
-  `mul_alpha` fold lands in coefficient preparation, so it reuses the same
-  four-shuffle shape as the polynomial tower). The remaining vectorization work
-  is the shuffle/NEON/wasm arms of the same identities, the wider Fan–Paar
-  fields (32/64/8), and the canonical Fan–Paar tower at 32/64 bits, which still
-  use the portable reference.
+  levels above GF(2^16)); the canonical Fan–Paar GF(2^16)/32/64 have x86
+  AVX2/SSSE3 kernels (the `mul_alpha` fold lands in coefficient preparation,
+  so each reuses the same four-shuffle shape as the polynomial tower, composed
+  recursively for the wider fields). The remaining vectorization work is the
+  shuffle/NEON/wasm arms of the same identities, the AVX2-512 and SSSE3
+  variants for the wider fields, and FanPaar8, which still uses the portable
+  reference.
 
 ## Deliberate non-goals
 

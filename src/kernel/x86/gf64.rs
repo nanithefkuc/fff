@@ -64,7 +64,7 @@ pub fn gf64_tiles(coeff: gf64::Elem) -> [u64; 8] {
 
 /// `PSHUFB` control that exchanges the two GF(2^32) halves of every
 /// GF(2^64) element — a 4-byte-granular swap, period 8.
-const SWAP4: [u8; 32] = [
+pub(crate) const SWAP4: [u8; 32] = [
     4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15,
     8, 9, 10, 11,
 ];

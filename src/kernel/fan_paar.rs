@@ -9,7 +9,7 @@
 //! prepared operation from `mul_add`, so the win reaches scatter/gather/
 //! matrix through a prepared [`crate::ops::Plan`] without a per-shape kernel.
 
-use crate::field::fan_paar::{FanPaar8, FanPaar16, FanPaar32, FanPaar64, fp16};
+use crate::field::fan_paar::{FanPaar8, FanPaar16, FanPaar32, FanPaar64, fp16, fp32, fp64};
 #[allow(unused_imports)]
 use crate::kernel::{Backend, FieldKernels, backend, scalar};
 
@@ -17,8 +17,200 @@ use crate::kernel::{Backend, FieldKernels, backend, scalar};
 use crate::kernel::x86;
 
 crate::kernel::scalar::impl_field_kernels!(FanPaar8);
-crate::kernel::scalar::impl_field_kernels!(FanPaar32);
-crate::kernel::scalar::impl_field_kernels!(FanPaar64);
+
+impl FieldKernels for FanPaar32 {
+    type Prepared = fp32::Elem;
+
+    #[inline]
+    fn prepare(coeff: fp32::Elem) -> Self::Prepared {
+        coeff
+    }
+
+    #[inline]
+    fn prepared_coeff(prepared: &Self::Prepared) -> fp32::Elem {
+        *prepared
+    }
+
+    #[inline]
+    fn active_backend() -> Backend {
+        match backend() {
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Avx512 | Backend::Gfni | Backend::Avx2 => backend(),
+            _ => Backend::Scalar,
+        }
+    }
+
+    #[inline]
+    fn has_vector_elementwise() -> bool {
+        false
+    }
+
+    #[inline]
+    fn mul_add(dst: &mut [u8], coeff: &Self::Prepared, src: &[u8]) {
+        match backend() {
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Avx512 | Backend::Gfni | Backend::Avx2 => {
+                x86::fan_paar::mul_add_fp32_avx2(dst, *coeff, src);
+            }
+            _ => scalar::mul_add::<FanPaar32>(dst, *coeff, src),
+        }
+    }
+
+    #[inline]
+    fn mul_assign(dst: &mut [u8], coeff: &Self::Prepared) {
+        match backend() {
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Avx512 | Backend::Gfni | Backend::Avx2 => {
+                x86::fan_paar::mul_assign_fp32_avx2(dst, *coeff);
+            }
+            _ => scalar::mul_assign::<FanPaar32>(dst, *coeff),
+        }
+    }
+
+    #[inline]
+    fn mul_into(dst: &mut [u8], coeff: &Self::Prepared, src: &[u8]) {
+        match backend() {
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Avx512 | Backend::Gfni | Backend::Avx2 => {
+                x86::fan_paar::mul_into_fp32_avx2(dst, *coeff, src);
+            }
+            _ => {
+                dst.copy_from_slice(src);
+                scalar::mul_assign::<FanPaar32>(dst, *coeff);
+            }
+        }
+    }
+
+    #[inline]
+    fn mul_add_scatter(rows: &mut [u8], row_len: usize, coeffs: &[fp32::Elem], src: &[u8]) {
+        for (row, &coeff) in rows.chunks_exact_mut(row_len).zip(coeffs) {
+            Self::mul_add(row, &Self::prepare(coeff), src);
+        }
+    }
+
+    #[inline]
+    fn mul_add_gather(dst: &mut [u8], coeffs: &[fp32::Elem], srcs: &[&[u8]]) {
+        for (&coeff, &src) in coeffs.iter().zip(srcs) {
+            Self::mul_add(dst, &Self::prepare(coeff), src);
+        }
+    }
+
+    #[inline]
+    fn mul_add_matrix(
+        rows: &mut [u8],
+        row_len: usize,
+        nrows: usize,
+        terms: &[(&[fp32::Elem], &[u8])],
+    ) {
+        for &(coeffs, src) in terms {
+            for (row, &coeff) in rows.chunks_exact_mut(row_len).take(nrows).zip(coeffs) {
+                Self::mul_add(row, &Self::prepare(coeff), src);
+            }
+        }
+    }
+
+    #[inline]
+    fn mul_elementwise(dst: &mut [u8], a: &[u8], b: &[u8]) {
+        scalar::mul_elementwise::<FanPaar32>(dst, a, b);
+    }
+}
+
+impl FieldKernels for FanPaar64 {
+    type Prepared = fp64::Elem;
+
+    #[inline]
+    fn prepare(coeff: fp64::Elem) -> Self::Prepared {
+        coeff
+    }
+
+    #[inline]
+    fn prepared_coeff(prepared: &Self::Prepared) -> fp64::Elem {
+        *prepared
+    }
+
+    #[inline]
+    fn active_backend() -> Backend {
+        match backend() {
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Avx512 | Backend::Gfni | Backend::Avx2 => backend(),
+            _ => Backend::Scalar,
+        }
+    }
+
+    #[inline]
+    fn has_vector_elementwise() -> bool {
+        false
+    }
+
+    #[inline]
+    fn mul_add(dst: &mut [u8], coeff: &Self::Prepared, src: &[u8]) {
+        match backend() {
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Avx512 | Backend::Gfni | Backend::Avx2 => {
+                x86::fan_paar::mul_add_fp64_avx2(dst, *coeff, src);
+            }
+            _ => scalar::mul_add::<FanPaar64>(dst, *coeff, src),
+        }
+    }
+
+    #[inline]
+    fn mul_assign(dst: &mut [u8], coeff: &Self::Prepared) {
+        match backend() {
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Avx512 | Backend::Gfni | Backend::Avx2 => {
+                x86::fan_paar::mul_assign_fp64_avx2(dst, *coeff);
+            }
+            _ => scalar::mul_assign::<FanPaar64>(dst, *coeff),
+        }
+    }
+
+    #[inline]
+    fn mul_into(dst: &mut [u8], coeff: &Self::Prepared, src: &[u8]) {
+        match backend() {
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Avx512 | Backend::Gfni | Backend::Avx2 => {
+                x86::fan_paar::mul_into_fp64_avx2(dst, *coeff, src);
+            }
+            _ => {
+                dst.copy_from_slice(src);
+                scalar::mul_assign::<FanPaar64>(dst, *coeff);
+            }
+        }
+    }
+
+    #[inline]
+    fn mul_add_scatter(rows: &mut [u8], row_len: usize, coeffs: &[fp64::Elem], srcs: &[u8]) {
+        for (row, &coeff) in rows.chunks_exact_mut(row_len).zip(coeffs) {
+            Self::mul_add(row, &Self::prepare(coeff), srcs);
+        }
+    }
+
+    #[inline]
+    fn mul_add_gather(dst: &mut [u8], coeffs: &[fp64::Elem], srcs: &[&[u8]]) {
+        for (&coeff, &src) in coeffs.iter().zip(srcs) {
+            Self::mul_add(dst, &Self::prepare(coeff), src);
+        }
+    }
+
+    #[inline]
+    fn mul_add_matrix(
+        rows: &mut [u8],
+        row_len: usize,
+        nrows: usize,
+        terms: &[(&[fp64::Elem], &[u8])],
+    ) {
+        for &(coeffs, src) in terms {
+            for (row, &coeff) in rows.chunks_exact_mut(row_len).take(nrows).zip(coeffs) {
+                Self::mul_add(row, &Self::prepare(coeff), src);
+            }
+        }
+    }
+
+    #[inline]
+    fn mul_elementwise(dst: &mut [u8], a: &[u8], b: &[u8]) {
+        scalar::mul_elementwise::<FanPaar64>(dst, a, b);
+    }
+}
 
 /// A Fan–Paar GF(2^16) coefficient resolved into the form this host's backend
 /// wants.

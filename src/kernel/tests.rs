@@ -17,7 +17,7 @@ extern crate std;
 use std::vec;
 use std::vec::Vec;
 
-use crate::field::{FanPaar16, Gf32, Gf64, fan_paar, gf8, gf16, gf32, gf64};
+use crate::field::{FanPaar16, FanPaar32, FanPaar64, Gf32, Gf64, fan_paar, gf8, gf16, gf32, gf64};
 use crate::kernel::scalar;
 use crate::kernel::tables::{FpTowerTables, ScaleTable, TowerCoeff, TowerTables, scale_table};
 
@@ -371,6 +371,79 @@ fn fp16_assign_reference(dst: &mut [u8], coeff: fan_paar::fp16::Elem) {
 fn fp16_into_reference(dst: &mut [u8], coeff: fan_paar::fp16::Elem, src: &[u8]) {
     dst.copy_from_slice(src);
     scalar::mul_assign::<FanPaar16>(dst, coeff);
+}
+
+/// Fan–Paar GF(2^32) coefficients, the same shape as the polynomial towers.
+fn fp32_coeffs() -> Vec<fan_paar::fp32::Elem> {
+    use fan_paar::{fp16, fp32};
+    let mut v = vec![
+        fp32::Elem::ZERO,
+        fp32::Elem::ONE,
+        fp32::Elem(u32::MAX),
+        fp32::Elem::from_components(fp16::Elem::ONE, fp16::Elem::ZERO),
+        fp32::Elem::from_components(fp16::Elem::ZERO, fp16::Elem::ONE),
+        fp32::ALPHA,
+        fp32::Elem::from_components(fp16::Elem::ZERO, fp16::ALPHA),
+        fp32::GENERATOR,
+    ];
+    let mut s = 0x243f_6a88u32;
+    for _ in 0..16 {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        v.push(fp32::Elem(s));
+    }
+    v
+}
+
+/// Fan–Paar GF(2^64) coefficients.
+fn fp64_coeffs() -> Vec<fan_paar::fp64::Elem> {
+    use fan_paar::{fp32, fp64};
+    let mut v = vec![
+        fp64::Elem::ZERO,
+        fp64::Elem::ONE,
+        fp64::Elem(u64::MAX),
+        fp64::Elem::from_components(fp32::Elem::ONE, fp32::Elem::ZERO),
+        fp64::ALPHA,
+        fp64::Elem::from_components(fp32::Elem::ZERO, fp32::ALPHA),
+        fp64::GENERATOR,
+    ];
+    let mut s = 0x243f_6a88_85a3_08d3u64;
+    for _ in 0..16 {
+        s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        v.push(fp64::Elem(s));
+    }
+    v
+}
+
+/// Fan–Paar GF(2^32) lengths: multiples of 4 straddling 32-byte lanes.
+const FP32_LENGTHS: &[usize] = &[
+    0, 4, 8, 16, 28, 32, 36, 60, 64, 68, 124, 128, 132, 252, 256, 260, 508, 512, 1020, 1024,
+];
+/// Fan–Paar GF(2^64) lengths: multiples of 8.
+const FP64_LENGTHS: &[usize] = &[
+    0, 8, 16, 24, 32, 40, 56, 64, 72, 120, 128, 136, 248, 256, 264, 504, 512, 1016, 1024,
+];
+
+fn fp32_reference(dst: &mut [u8], coeff: fan_paar::fp32::Elem, src: &[u8]) {
+    scalar::mul_add::<FanPaar32>(dst, coeff, src);
+}
+fn fp32_assign_reference(dst: &mut [u8], coeff: fan_paar::fp32::Elem) {
+    scalar::mul_assign::<FanPaar32>(dst, coeff);
+}
+fn fp32_into_reference(dst: &mut [u8], coeff: fan_paar::fp32::Elem, src: &[u8]) {
+    dst.copy_from_slice(src);
+    scalar::mul_assign::<FanPaar32>(dst, coeff);
+}
+fn fp64_reference(dst: &mut [u8], coeff: fan_paar::fp64::Elem, src: &[u8]) {
+    scalar::mul_add::<FanPaar64>(dst, coeff, src);
+}
+fn fp64_assign_reference(dst: &mut [u8], coeff: fan_paar::fp64::Elem) {
+    scalar::mul_assign::<FanPaar64>(dst, coeff);
+}
+fn fp64_into_reference(dst: &mut [u8], coeff: fan_paar::fp64::Elem, src: &[u8]) {
+    dst.copy_from_slice(src);
+    scalar::mul_assign::<FanPaar64>(dst, coeff);
 }
 
 /// GF(2^32) coefficients: the short-circuits, the extremes, pure tower
@@ -761,7 +834,15 @@ mod x86 {
             gf16_reference,
             x86::gf16::matrix_avx2,
         );
-        // Fan–Paar GF(2^16): the four-shuffle tower over the fp8 nibble bank.
+        // Fan–Paar tower (GF(2^16)/32/64): the fp8 nibble tower and its
+        // period-2 lane-mul extensions.
+        check_fan_paar_avx2_kernels();
+    }
+
+    /// Differential-check the Fan–Paar GF(2^16)/32/64 AVX2 kernels — the fp8
+    /// nibble tower and its period-2 lane-mul extensions — against the scalar
+    /// oracle.
+    fn check_fan_paar_avx2_kernels() {
         check_tower_mul_add(
             "fp16 avx2 mul_add",
             FP16_LENGTHS,
@@ -787,6 +868,60 @@ mod x86 {
             fp16_into_reference,
             |dst, coeff, src| {
                 x86::fan_paar::mul_into_avx2(dst, &FpTowerTables::new(coeff), src);
+            },
+        );
+        check_tower_mul_add(
+            "fp32 avx2 mul_add",
+            FP32_LENGTHS,
+            &fp32_coeffs(),
+            fp32_reference,
+            |dst, coeff, src| {
+                x86::fan_paar::mul_add_fp32_avx2(dst, coeff, src);
+            },
+        );
+        check_tower_mul_assign(
+            "fp32 avx2 mul_assign",
+            FP32_LENGTHS,
+            &fp32_coeffs(),
+            fp32_assign_reference,
+            |dst, coeff| {
+                x86::fan_paar::mul_assign_fp32_avx2(dst, coeff);
+            },
+        );
+        check_tower_mul_into(
+            "fp32 avx2 mul_into",
+            FP32_LENGTHS,
+            &fp32_coeffs(),
+            fp32_into_reference,
+            |dst, coeff, src| {
+                x86::fan_paar::mul_into_fp32_avx2(dst, coeff, src);
+            },
+        );
+        check_tower_mul_add(
+            "fp64 avx2 mul_add",
+            FP64_LENGTHS,
+            &fp64_coeffs(),
+            fp64_reference,
+            |dst, coeff, src| {
+                x86::fan_paar::mul_add_fp64_avx2(dst, coeff, src);
+            },
+        );
+        check_tower_mul_assign(
+            "fp64 avx2 mul_assign",
+            FP64_LENGTHS,
+            &fp64_coeffs(),
+            fp64_assign_reference,
+            |dst, coeff| {
+                x86::fan_paar::mul_assign_fp64_avx2(dst, coeff);
+            },
+        );
+        check_tower_mul_into(
+            "fp64 avx2 mul_into",
+            FP64_LENGTHS,
+            &fp64_coeffs(),
+            fp64_into_reference,
+            |dst, coeff, src| {
+                x86::fan_paar::mul_into_fp64_avx2(dst, coeff, src);
             },
         );
     }

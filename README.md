@@ -40,8 +40,8 @@ MSRV is Rust 1.89.
 | GF(2^64) | `Gf64` | `gf64::Elem` | quadratic tower over `Gf32` | GFNI x86 |
 | Fan–Paar GF(2^8) | `FanPaar8` | `fan_paar::fp8::Elem` | canonical recursive tower | portable |
 | Fan–Paar GF(2^16) | `FanPaar16` | `fan_paar::fp16::Elem` | canonical recursive tower | x86 AVX2/SSSE3 |
-| Fan–Paar GF(2^32) | `FanPaar32` | `fan_paar::fp32::Elem` | canonical recursive tower | portable |
-| Fan–Paar GF(2^64) | `FanPaar64` | `fan_paar::fp64::Elem` | canonical recursive tower | portable |
+| Fan–Paar GF(2^32) | `FanPaar32` | `fan_paar::fp32::Elem` | canonical recursive tower | x86 AVX2 |
+| Fan–Paar GF(2^64) | `FanPaar64` | `fan_paar::fp64::Elem` | canonical recursive tower | x86 AVX2 |
 
 ## Scalar arithmetic
 
@@ -125,8 +125,8 @@ boundaries instead of writing chunk loops by hand.
 
 `backend()` reports the process-wide SIMD selection. `backend_for::<F>()`
 reports what a particular field actually uses; the GF(2^32)/GF(2^64) towers
-report the GFNI backend on x86 GFNI hosts and `scalar` elsewhere, Fan–Paar
-GF(2^16) reports AVX2/SSSE3 on x86, and the remaining Fan–Paar fields report
+report the GFNI backend on x86 GFNI hosts, the canonical Fan–Paar GF(2^16)/
+GF(2^32)/GF(2^64) report AVX2/SSSE3 on x86, and the remaining fields report
 `scalar`. `has_vector_elementwise::<F>()` exposes the notable performance
 boundary of `mul_elementwise`.
 

@@ -21,16 +21,20 @@ All notable changes to this project are documented here. The format follows
   Karatsuba. Shuffle backends, NEON, wasm, and `mul_elementwise` keep the
   portable path. A representation-agnostic `Tower2Coeff` carries the period-2
   subfield coefficient pair for the GF(p) effort to reuse.
-- Fan–Paar GF(2^16) AVX2/SSSE3 kernels for x86: `mul_add`, `mul_assign`,
-  and `mul_into` as the four-nibble-shuffle tower over the `fp8` nibble
-  bank — the same shape as the polynomial GF(2^16) kernel, with the
-  `mul_alpha` recurrence folded into coefficient preparation by subfield
-  commutativity (`alpha·(c1·x1) = (alpha·c1)·x1`). On a 256 KiB `mul_add`
-  (Core Ultra 7 258V, Linux, rustc 1.93, gfni dispatching AVX2) this is
-  ~170× (FanPaar16, 0.11 → 19.8 GiB/s) over the portable scalar path. A
-  shared `NibbleFactors` trait lets the polynomial and Fan–Paar towers
-  reuse the tested `scale_avx2`/`scale_ssse3` core; FanPaar32/64 and the
-  NEON/wasm arms keep the portable path.
+- Fan–Paar `mul_add`/`mul_assign`/`mul_into` kernels for x86, all levels that
+  leave the portable path: GF(2^16) on AVX2/SSSE3 (the four-nibble-shuffle
+  tower over a new `fp8` nibble bank — fp8 is not the AES field, so no GFNI
+  fast path) and GF(2^32)/GF(2^64) on AVX2 (period-2 fp16/fp32 lane muls).
+  The `mul_alpha` recurrence folds into coefficient preparation by subfield
+  commutativity (`alpha·(c1·x1) = (alpha·c1)·x1`), so the kernel is purely two
+  alternating subfield lane muls — no novel in-kernel `mul_alpha` network. A
+  shared `NibbleFactors` trait reuses the tested `scale_avx2`/`scale_ssse3`
+  core. On a 256 KiB `mul_add` (Core Ultra 7 258V, Linux, rustc 1.93, gfni
+  dispatching AVX2): FanPaar16 ~0.11 → 7.6 GiB/s, FanPaar32 ~0.08 → 2.9
+  GiB/s, FanPaar64 ~0.05 → 1.1 GiB/s (order-of-magnitude over the portable
+  path; numbers vary on this hybrid CPU without core pinning). FanPaar8
+  (already fast via the log table), SSSE3 for 32/64, and NEON/wasm keep the
+  portable path.
 - `internals` feature exposing the kernel modules and preparation types
   (`ScaleTable`, `TowerCoeff`, `TowerTables`, backend-specific SIMD entry
   points) for downstream libraries that build directly on the kernels.

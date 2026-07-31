@@ -15,7 +15,8 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use fff::{
-    FanPaar16, FanPaar32, Gf8, Gf16, Gf32, Gf64, backend, fan_paar, gf8, gf16, gf32, gf64, ops,
+    FanPaar16, FanPaar32, FanPaar64, Gf8, Gf16, Gf32, Gf64, backend, fan_paar, gf8, gf16, gf32,
+    gf64, ops,
 };
 
 fn noise(len: usize, seed: u64) -> Vec<u8> {
@@ -545,6 +546,13 @@ fn main() {
         ops::mul_add::<FanPaar32>(
             black_box(&mut tier3_dst),
             fan_paar::fp32::Elem(0x03e2_1cea),
+            black_box(&tier3_src),
+        );
+    });
+    bench("mul_add canonical Fan-Paar  fp64", tier3_len, || {
+        ops::mul_add::<FanPaar64>(
+            black_box(&mut tier3_dst),
+            fan_paar::fp64::Elem(0x070f_870d_cd9c_1d88),
             black_box(&tier3_src),
         );
     });
