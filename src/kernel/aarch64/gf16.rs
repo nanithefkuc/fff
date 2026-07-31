@@ -24,7 +24,7 @@
 use core::arch::aarch64::*;
 
 use crate::field::gf16::Elem;
-use crate::kernel::gf16::{mul_add_scalar, mul_assign_scalar};
+use crate::kernel::gf16::{mul_add_scalar, mul_assign_scalar, mul_into_scalar};
 use crate::kernel::tables::TowerTables;
 
 /// Terms folded into a single register-resident destination pass.
@@ -162,8 +162,8 @@ fn scaled_vector(source: uint8x16_t, factors: &Factors) -> uint8x16_t {
     scaled(split(source), factors)
 }
 
-/// `dst ^= coeff * src` over interleaved GF(2^16) elements, 16 bytes at a
-/// time.
+/// `dst ^= coeff * src` over interleaved GF(2^16) elements, two 16-byte lanes
+/// at a time.
 pub fn mul_add_neon(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: NEON is baseline on AArch64, the two slices are independently
@@ -174,12 +174,28 @@ pub fn mul_add_neon(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
 #[target_feature(enable = "neon")]
 unsafe fn mul_add_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     let span = dst.len().min(src.len());
-    let len = span & !15;
     let factors = load_factors(tables);
     let (dst_ptr, src_ptr) = (dst.as_mut_ptr(), src.as_ptr());
     let mut offset = 0;
-    while offset < len {
-        // SAFETY: `offset + 16 <= len <= min(dst.len(), src.len())`.
+    // Two independent lanes per iteration: eight table lookups per lane have
+    // enough latency to hide the other lane's loads and nibble splits behind
+    // (BENCHMARKS.md).
+    while offset + 32 <= span {
+        // SAFETY: `offset + 32 <= span <= min(dst.len(), src.len())`.
+        unsafe {
+            let x0 = vld1q_u8(src_ptr.add(offset));
+            let x1 = vld1q_u8(src_ptr.add(offset + 16));
+            let d0 = vld1q_u8(dst_ptr.add(offset));
+            let d1 = vld1q_u8(dst_ptr.add(offset + 16));
+            let p0 = scaled_vector(x0, &factors);
+            let p1 = scaled_vector(x1, &factors);
+            vst1q_u8(dst_ptr.add(offset), veorq_u8(d0, p0));
+            vst1q_u8(dst_ptr.add(offset + 16), veorq_u8(d1, p1));
+        }
+        offset += 32;
+    }
+    while offset + 16 <= span {
+        // SAFETY: `offset + 16 <= span <= min(dst.len(), src.len())`.
         unsafe {
             let source = vld1q_u8(src_ptr.add(offset));
             let current = vld1q_u8(dst_ptr.add(offset));
@@ -188,7 +204,7 @@ unsafe fn mul_add_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
         }
         offset += 16;
     }
-    mul_add_scalar(&mut dst[len..span], tables.coeff, &src[len..span]);
+    mul_add_scalar(&mut dst[offset..span], tables.coeff, &src[offset..span]);
 }
 
 /// `dst = coeff * dst` over interleaved GF(2^16) elements.
@@ -200,19 +216,69 @@ pub fn mul_assign_neon(dst: &mut [u8], tables: &TowerTables) {
 
 #[target_feature(enable = "neon")]
 unsafe fn mul_assign_impl(dst: &mut [u8], tables: &TowerTables) {
-    let len = dst.len() & !15;
+    let len = dst.len();
     let factors = load_factors(tables);
     let dst_ptr = dst.as_mut_ptr();
     let mut offset = 0;
-    while offset < len {
-        // SAFETY: `offset + 16 <= len <= dst.len()`.
+    while offset + 32 <= len {
+        // SAFETY: `offset + 32 <= len == dst.len()`.
+        unsafe {
+            let d0 = vld1q_u8(dst_ptr.add(offset));
+            let d1 = vld1q_u8(dst_ptr.add(offset + 16));
+            let p0 = scaled_vector(d0, &factors);
+            let p1 = scaled_vector(d1, &factors);
+            vst1q_u8(dst_ptr.add(offset), p0);
+            vst1q_u8(dst_ptr.add(offset + 16), p1);
+        }
+        offset += 32;
+    }
+    while offset + 16 <= len {
+        // SAFETY: `offset + 16 <= len == dst.len()`.
         unsafe {
             let current = vld1q_u8(dst_ptr.add(offset));
             vst1q_u8(dst_ptr.add(offset), scaled_vector(current, &factors));
         }
         offset += 16;
     }
-    mul_assign_scalar(&mut dst[len..], tables.coeff);
+    mul_assign_scalar(&mut dst[offset..], tables.coeff);
+}
+
+/// `dst = coeff * src` out of place, two 16-byte lanes at a time.
+///
+/// Fuses what would otherwise be a copy followed by an in-place scale: one
+/// pass over the destination, which is never read.
+pub fn mul_into_neon(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
+    debug_assert_eq!(dst.len(), src.len());
+    // SAFETY: NEON is baseline on AArch64, the two slices are independently
+    // borrowed, and the loop is bounded by the shorter of the two.
+    unsafe { mul_into_impl(dst, tables, src) }
+}
+
+#[target_feature(enable = "neon")]
+unsafe fn mul_into_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
+    let span = dst.len().min(src.len());
+    let factors = load_factors(tables);
+    let (dst_ptr, src_ptr) = (dst.as_mut_ptr(), src.as_ptr());
+    let mut offset = 0;
+    while offset + 32 <= span {
+        // SAFETY: `offset + 32 <= span <= min(dst.len(), src.len())`.
+        unsafe {
+            let x0 = vld1q_u8(src_ptr.add(offset));
+            let x1 = vld1q_u8(src_ptr.add(offset + 16));
+            vst1q_u8(dst_ptr.add(offset), scaled_vector(x0, &factors));
+            vst1q_u8(dst_ptr.add(offset + 16), scaled_vector(x1, &factors));
+        }
+        offset += 32;
+    }
+    while offset + 16 <= span {
+        // SAFETY: `offset + 16 <= span <= min(dst.len(), src.len())`.
+        unsafe {
+            let source = vld1q_u8(src_ptr.add(offset));
+            vst1q_u8(dst_ptr.add(offset), scaled_vector(source, &factors));
+        }
+        offset += 16;
+    }
+    mul_into_scalar(&mut dst[offset..span], tables.coeff, &src[offset..span]);
 }
 
 /// `row ^= src`, the whole job when a scattered coefficient is one.
@@ -571,7 +637,7 @@ unsafe fn gather_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
 
 /// Lane-parallel base-field multiply for two varying byte vectors.
 ///
-/// AArch64 guarantees NEON but not the optional crypto extension containing
+/// `AArch64` guarantees NEON but not the optional crypto extension containing
 /// `PMULL`; eight branchless shift/reduce rounds therefore form the portable
 /// vector primitive used by both supported fields.
 #[inline]
@@ -590,6 +656,14 @@ fn multiply_base_vectors(mut a: uint8x16_t, mut b: uint8x16_t) -> uint8x16_t {
     }
     product
 }
+
+// The tower form of the same identity over `PMULL` — two period-2 broadcasts
+// (`[c0, c0+c1]` on the block, `[DELTA*c1, c1]` on its adjacent-byte swap),
+// no nibble tables at all — was written and measured far behind the
+// four-shuffle kernels above at every row length. Cheap preparation only paid
+// on rows below one vector, and only for one-shot calls, which is not worth
+// carrying a second prepared form for. See the note in `super::gf8` for the
+// instruction-count reason, and BENCHMARKS.md for the numbers.
 
 /// `dst[i] = a[i] * b[i]` over interleaved tower elements.
 pub fn elementwise_neon(dst: &mut [u8], a: &[u8], b: &[u8]) {
@@ -619,58 +693,6 @@ unsafe fn elementwise_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
             let direct = multiply_base_vectors(x, y);
             let crossed = multiply_base_vectors(x, vrev16q_u8(y));
             let delta_bd = multiply_base_vectors(vrev16q_u8(direct), delta_even);
-            let constant = veorq_u8(direct, delta_bd);
-            let extension = veorq_u8(veorq_u8(crossed, vrev16q_u8(crossed)), direct);
-            vst1q_u8(
-                dst.as_mut_ptr().add(offset),
-                vbslq_u8(even, constant, extension),
-            );
-        }
-        offset += 16;
-    }
-    for ((d, x), y) in dst[len..]
-        .chunks_exact_mut(2)
-        .zip(a[len..].chunks_exact(2))
-        .zip(b[len..].chunks_exact(2))
-    {
-        d.copy_from_slice(
-            &Elem::from_bytes([x[0], x[1]])
-                .mul(Elem::from_bytes([y[0], y[1]]))
-                .to_bytes(),
-        );
-    }
-}
-
-/// `dst[i] = a[i] * b[i]` over tower elements using the optional `PMULL`
-/// extension for each base-field product.
-pub fn elementwise_pmull(dst: &mut [u8], a: &[u8], b: &[u8]) {
-    debug_assert_eq!(dst.len(), a.len());
-    debug_assert_eq!(dst.len(), b.len());
-    // SAFETY: dispatch checked the AArch64 `aes` feature, which includes
-    // `PMULL`, and all three lengths match.
-    unsafe { elementwise_pmull_impl(dst, a, b) }
-}
-
-#[target_feature(enable = "neon,aes")]
-unsafe fn elementwise_pmull_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
-    let len = dst.len().min(a.len()).min(b.len()) & !15;
-    let even = vreinterpretq_u8_u16(vdupq_n_u16(0x00ff));
-    let delta_even = vreinterpretq_u8_u16(vdupq_n_u16(u16::from_le_bytes([
-        crate::field::gf16::DELTA.0,
-        0,
-    ])));
-    let mut offset = 0;
-    while offset < len {
-        // For x=[a,b], y=[c,d]:
-        // constant = ac ^ DELTA*bd
-        // extension = ad ^ bc ^ bd.
-        // SAFETY: `offset + 16 <= len`, which bounds all three slices.
-        unsafe {
-            let x = vld1q_u8(a.as_ptr().add(offset));
-            let y = vld1q_u8(b.as_ptr().add(offset));
-            let direct = super::gf8::multiply_vectors_pmull(x, y);
-            let crossed = super::gf8::multiply_vectors_pmull(x, vrev16q_u8(y));
-            let delta_bd = super::gf8::multiply_vectors_pmull(vrev16q_u8(direct), delta_even);
             let constant = veorq_u8(direct, delta_bd);
             let extension = veorq_u8(veorq_u8(crossed, vrev16q_u8(crossed)), direct);
             vst1q_u8(

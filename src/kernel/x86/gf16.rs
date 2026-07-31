@@ -21,14 +21,20 @@
 //!   [`TowerTables`]; the even and odd
 //!   byte lanes are then selected with a `0x00ff` halfword mask.
 //!
-//! The multi-row kernels are GFNI-only: without a native byte multiply the
-//! shuffle ports, not the destination traffic, are the bottleneck, so
-//! blocking buys nothing there.
+//! Multi-row wiring differs by backend, and deliberately so. SSSE3 blocks
+//! both gather and matrix; GFNI blocks the matrix but gathers with repeated
+//! AXPY; AVX2 uses repeated AXPY for both. A GF(2^16) coefficient costs four
+//! nibble tables or two broadcast words, so how many of them can stay
+//! resident is what decides whether blocking beats re-reading the
+//! destination — see the crossover notes on the `kernel::gf16` dispatch arms,
+//! and BENCHMARKS.md, before rewiring any of these.
 
 use crate::field::gf16::Elem;
 use crate::kernel::Matrix;
-use crate::kernel::gf16::{Prepared, mul_add_scalar, mul_assign_scalar, mul_into_scalar};
-use crate::kernel::tables::{TowerCoeff, TowerTables};
+use crate::kernel::gf16::{
+    Prepared, factor_tables, mul_add_scalar, mul_assign_scalar, mul_into_scalar,
+};
+use crate::kernel::tables::{NibbleFactors, ScaleTable, TowerCoeff, TowerTables, scale_table};
 
 /// A GF(2^16) coefficient in a form the shuffle kernels can consume.
 pub trait TableCoefficient {
@@ -135,6 +141,21 @@ fn scale_gfni(src: __m256i, swapped: __m256i, same: __m256i, cross: __m256i) -> 
     )
 }
 
+/// `coeff * src` for one 16-byte lane, the SSE-width [`scale_gfni`].
+///
+/// Each 256-bit kernel takes one 128-bit step before its scalar tail, so a
+/// 16..31-byte remainder is not multiplied a byte at a time. The feature list
+/// is the callers' — every one of them is already `avx2,gfni`, and that also
+/// guarantees the SSE2 baseline on 32-bit x86.
+#[inline]
+#[target_feature(enable = "avx2,gfni")]
+fn scale_gfni128(src: __m128i, swapped: __m128i, same: __m128i, cross: __m128i) -> __m128i {
+    _mm_xor_si128(
+        _mm_gf2p8mul_epi8(src, same),
+        _mm_gf2p8mul_epi8(swapped, cross),
+    )
+}
+
 /// `dst ^= coeff * src` with `GF2P8MULB` over 32-byte lanes.
 pub fn mul_add_gfni(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
@@ -193,6 +214,23 @@ unsafe fn mul_add_gfni_impl(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
         }
         offset += 32;
     }
+    // One 128-bit step down before the scalar tail. The casts are register
+    // aliases, not instructions: the low half of a broadcast is the same
+    // broadcast.
+    if offset + 16 <= len {
+        let same128 = _mm256_castsi256_si128(same);
+        let cross128 = _mm256_castsi256_si128(cross);
+        let swap128 = _mm256_castsi256_si128(swap);
+        // SAFETY: `offset + 16 <= len <= dst.len().min(src.len())` bounds the
+        // load pair and the store.
+        unsafe {
+            let x = _mm_loadu_si128(src_ptr.add(offset).cast());
+            let d = _mm_loadu_si128(dst_ptr.add(offset).cast());
+            let scaled = scale_gfni128(x, _mm_shuffle_epi8(x, swap128), same128, cross128);
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), _mm_xor_si128(d, scaled));
+        }
+        offset += 16;
+    }
     // Every step above is a whole number of elements, so the tail starts on
     // an element boundary.
     mul_add_scalar(&mut dst[offset..len], coeff.coeff, &src[offset..len]);
@@ -229,6 +267,26 @@ unsafe fn mul_assign_gfni_impl(dst: &mut [u8], coeff: TowerCoeff) {
         }
         offset += 32;
     }
+    // One 128-bit step down before the scalar tail; the casts are register
+    // aliases, not instructions.
+    if offset + 16 <= len {
+        let same128 = _mm256_castsi256_si128(same);
+        let cross128 = _mm256_castsi256_si128(cross);
+        let swap128 = _mm256_castsi256_si128(swap);
+        // SAFETY: `offset + 16 <= len == dst.len()` bounds the load and the
+        // store.
+        unsafe {
+            let p = dst_ptr.add(offset);
+            let x = _mm_loadu_si128(p.cast());
+            _mm_storeu_si128(
+                p.cast(),
+                scale_gfni128(x, _mm_shuffle_epi8(x, swap128), same128, cross128),
+            );
+        }
+        offset += 16;
+    }
+    // Both steps above are a whole number of elements, so the tail starts on
+    // an element boundary.
     mul_assign_scalar(&mut dst[offset..], coeff.coeff);
 }
 
@@ -239,14 +297,27 @@ unsafe fn mul_assign_gfni_impl(dst: &mut [u8], coeff: TowerCoeff) {
 pub fn mul_into_gfni(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the GFNI backend, so AVX2 and GFNI are
-    // present; `dst` and `src` are separately borrowed slices.
-    unsafe { mul_into_gfni_impl(dst, coeff, src) }
+    // present; `dst` and `src` are separately borrowed slices, and `nt_split`
+    // returns an element-aligned, 32-byte-aligned split for the non-temporal
+    // body.
+    unsafe {
+        match super::nt_split(dst, 2) {
+            Some(peel) => {
+                let (head, body) = dst.split_at_mut(peel);
+                let (src_head, src_body) = src.split_at(peel);
+                mul_into_gfni_impl::<false>(head, coeff, src_head);
+                mul_into_gfni_impl::<true>(body, coeff, src_body);
+                _mm_sfence();
+            }
+            None => mul_into_gfni_impl::<false>(dst, coeff, src),
+        }
+    }
 }
 
 /// # Safety
 /// AVX2 and GFNI must be available on the host.
 #[target_feature(enable = "avx2,gfni")]
-unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
+unsafe fn mul_into_gfni_impl<const NT: bool>(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
     let len = dst.len().min(src.len());
     let (same_word, cross_word) = broadcast_words(coeff);
     let same = _mm256_set1_epi16(same_word);
@@ -269,10 +340,10 @@ unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
             let p1 = scale_gfni(x1, _mm256_shuffle_epi8(x1, swap), same, cross);
             let p2 = scale_gfni(x2, _mm256_shuffle_epi8(x2, swap), same, cross);
             let p3 = scale_gfni(x3, _mm256_shuffle_epi8(x3, swap), same, cross);
-            _mm256_storeu_si256(dp.cast(), p0);
-            _mm256_storeu_si256(dp.add(32).cast(), p1);
-            _mm256_storeu_si256(dp.add(64).cast(), p2);
-            _mm256_storeu_si256(dp.add(96).cast(), p3);
+            super::store256::<NT>(dp, p0);
+            super::store256::<NT>(dp.add(32), p1);
+            super::store256::<NT>(dp.add(64), p2);
+            super::store256::<NT>(dp.add(96), p3);
         }
         offset += 128;
     }
@@ -285,36 +356,57 @@ unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: TowerCoeff, src: &[u8]) {
         }
         offset += 32;
     }
+    // One 128-bit step down before the scalar tail; the casts are register
+    // aliases, not instructions.
+    if offset + 16 <= len {
+        let same128 = _mm256_castsi256_si128(same);
+        let cross128 = _mm256_castsi256_si128(cross);
+        let swap128 = _mm256_castsi256_si128(swap);
+        // SAFETY: `offset + 16 <= len <= dst.len().min(src.len())` bounds the
+        // load and the store.
+        unsafe {
+            let x = _mm_loadu_si128(src_ptr.add(offset).cast());
+            let scaled = scale_gfni128(x, _mm_shuffle_epi8(x, swap128), same128, cross128);
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), scaled);
+        }
+        offset += 16;
+    }
     // Every step above is a whole number of elements, so the tail starts on
     // an element boundary.
     mul_into_scalar(&mut dst[offset..len], coeff.coeff, &src[offset..len]);
 }
 
 /// Nibble tables and lane masks for one coefficient, held in AVX2 registers.
-struct NibbleAvx2 {
+pub(crate) struct NibbleAvx2 {
     /// Low-nibble table of factor `i`, the same 16 entries in both halves.
-    lo: [__m256i; 4],
+    pub(crate) lo: [__m256i; 4],
     /// High-nibble table of factor `i`, the same 16 entries in both halves.
-    hi: [__m256i; 4],
+    pub(crate) hi: [__m256i; 4],
     /// `0x0f` in every byte: the nibble-extraction mask.
-    nibble: __m256i,
+    pub(crate) nibble: __m256i,
     /// `0x00ff` in every halfword: selects each element's even (low) byte.
-    even: __m256i,
+    pub(crate) even: __m256i,
     /// Adjacent-byte exchange control.
-    swap: __m256i,
+    pub(crate) swap: __m256i,
 }
 
-/// Widen the 16-byte tables of `tables` into AVX2 registers.
+/// Widen the 16-byte factor tables of `tables` into AVX2 registers.
+///
+/// Generic over [`NibbleFactors`] so the GF(2^16) (AES-base) and Fan–Paar
+/// (`fp8`-base) towers share this loader and the [`scale_avx2`] core.
 #[inline]
 #[target_feature(enable = "avx2")]
-fn nibble_avx2(tables: &TowerTables) -> NibbleAvx2 {
+pub(crate) fn nibble_avx2<T: NibbleFactors>(tables: &T) -> NibbleAvx2 {
     let mut lo = [_mm256_setzero_si256(); 4];
     let mut hi = [_mm256_setzero_si256(); 4];
-    for (slot, factor) in tables.factors.iter().enumerate() {
-        // SAFETY: `lo` and `hi` are `[u8; 16]`, exactly the width of the load.
+    for slot in 0..4 {
+        // SAFETY: `lo`/`hi` entries are `[u8; 16]`, exactly the width of the
+        // broadcast load.
         unsafe {
-            lo[slot] = _mm256_broadcastsi128_si256(_mm_loadu_si128(factor.lo.as_ptr().cast()));
-            hi[slot] = _mm256_broadcastsi128_si256(_mm_loadu_si128(factor.hi.as_ptr().cast()));
+            lo[slot] =
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(tables.lo(slot).as_ptr().cast()));
+            hi[slot] =
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(tables.hi(slot).as_ptr().cast()));
         }
     }
     NibbleAvx2 {
@@ -325,11 +417,10 @@ fn nibble_avx2(tables: &TowerTables) -> NibbleAvx2 {
         swap: swap_mask256(),
     }
 }
-
 /// Split `value` into its low and high nibbles, both as byte indices.
 #[inline]
 #[target_feature(enable = "avx2")]
-fn split_avx2(value: __m256i, nibble: __m256i) -> (__m256i, __m256i) {
+pub(crate) fn split_avx2(value: __m256i, nibble: __m256i) -> (__m256i, __m256i) {
     (
         _mm256_and_si256(value, nibble),
         _mm256_and_si256(_mm256_srli_epi16(value, 4), nibble),
@@ -339,7 +430,7 @@ fn split_avx2(value: __m256i, nibble: __m256i) -> (__m256i, __m256i) {
 /// One base-field byte multiply: two table lookups over pre-split nibbles.
 #[inline]
 #[target_feature(enable = "avx2")]
-fn lookup_avx2(lo: __m256i, hi: __m256i, split: (__m256i, __m256i)) -> __m256i {
+pub(crate) fn lookup_avx2(lo: __m256i, hi: __m256i, split: (__m256i, __m256i)) -> __m256i {
     _mm256_xor_si256(
         _mm256_shuffle_epi8(lo, split.0),
         _mm256_shuffle_epi8(hi, split.1),
@@ -353,7 +444,7 @@ fn lookup_avx2(lo: __m256i, hi: __m256i, split: (__m256i, __m256i)) -> __m256i {
 /// mask operations relative to grouping by direct/crossed.
 #[inline]
 #[target_feature(enable = "avx2")]
-fn scale_avx2(src: __m256i, tables: &NibbleAvx2) -> __m256i {
+pub(crate) fn scale_avx2(src: __m256i, tables: &NibbleAvx2) -> __m256i {
     let swapped = _mm256_shuffle_epi8(src, tables.swap);
     let direct = split_avx2(src, tables.nibble);
     let crossed = split_avx2(swapped, tables.nibble);
@@ -398,6 +489,23 @@ unsafe fn mul_add_avx2_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
         }
         offset += 32;
     }
+    // One 128-bit step down before the scalar tail. SSSE3 is implied by AVX2,
+    // so the 16-byte helpers are callable here; their tables are narrowed
+    // only when the step is actually taken.
+    if offset + 16 <= len {
+        let narrow = nibble_ssse3(tables);
+        // SAFETY: `offset + 16 <= len <= dst.len().min(src.len())` bounds the
+        // load pair and the store.
+        unsafe {
+            let x = _mm_loadu_si128(src_ptr.add(offset).cast());
+            let d = _mm_loadu_si128(dst_ptr.add(offset).cast());
+            let scaled = scale_ssse3(x, &narrow);
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), _mm_xor_si128(d, scaled));
+        }
+        offset += 16;
+    }
+    // Both steps above are a whole number of elements, so the tail starts on
+    // an element boundary.
     mul_add_scalar(&mut dst[offset..len], tables.coeff, &src[offset..len]);
 }
 
@@ -425,6 +533,22 @@ unsafe fn mul_assign_avx2_impl(dst: &mut [u8], tables: &TowerTables) {
         }
         offset += 32;
     }
+    // One 128-bit step down before the scalar tail. SSSE3 is implied by AVX2,
+    // so the 16-byte helpers are callable here; their tables are narrowed
+    // only when the step is actually taken.
+    if offset + 16 <= len {
+        let narrow = nibble_ssse3(tables);
+        // SAFETY: `offset + 16 <= len == dst.len()` bounds the load and the
+        // store.
+        unsafe {
+            let p = dst_ptr.add(offset);
+            let x = _mm_loadu_si128(p.cast());
+            _mm_storeu_si128(p.cast(), scale_ssse3(x, &narrow));
+        }
+        offset += 16;
+    }
+    // Both steps above are a whole number of elements, so the tail starts on
+    // an element boundary.
     mul_assign_scalar(&mut dst[offset..], tables.coeff);
 }
 
@@ -435,14 +559,26 @@ unsafe fn mul_assign_avx2_impl(dst: &mut [u8], tables: &TowerTables) {
 pub fn mul_into_avx2(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the AVX2 backend; `dst` and `src` are
-    // separately borrowed slices.
-    unsafe { mul_into_avx2_impl(dst, tables, src) }
+    // separately borrowed slices, and `nt_split` returns an element-aligned,
+    // 32-byte-aligned split for the non-temporal body.
+    unsafe {
+        match super::nt_split(dst, 2) {
+            Some(peel) => {
+                let (head, body) = dst.split_at_mut(peel);
+                let (src_head, src_body) = src.split_at(peel);
+                mul_into_avx2_impl::<false>(head, tables, src_head);
+                mul_into_avx2_impl::<true>(body, tables, src_body);
+                _mm_sfence();
+            }
+            None => mul_into_avx2_impl::<false>(dst, tables, src),
+        }
+    }
 }
 
 /// # Safety
 /// AVX2 must be available on the host.
 #[target_feature(enable = "avx2")]
-unsafe fn mul_into_avx2_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
+unsafe fn mul_into_avx2_impl<const NT: bool>(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     let len = dst.len().min(src.len());
     let vectors = nibble_avx2(tables);
     let (dst_ptr, src_ptr) = (dst.as_mut_ptr(), src.as_ptr());
@@ -452,38 +588,56 @@ unsafe fn mul_into_avx2_impl(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
         // SAFETY: `offset + 32 <= len <= dst.len().min(src.len())`.
         unsafe {
             let x = _mm256_loadu_si256(src_ptr.add(offset).cast());
-            _mm256_storeu_si256(dst_ptr.add(offset).cast(), scale_avx2(x, &vectors));
+            super::store256::<NT>(dst_ptr.add(offset), scale_avx2(x, &vectors));
         }
         offset += 32;
     }
+    // One 128-bit step down before the scalar tail. SSSE3 is implied by AVX2,
+    // so the 16-byte helpers are callable here; their tables are narrowed
+    // only when the step is actually taken.
+    if offset + 16 <= len {
+        let narrow = nibble_ssse3(tables);
+        // SAFETY: `offset + 16 <= len <= dst.len().min(src.len())` bounds the
+        // load and the store.
+        unsafe {
+            let x = _mm_loadu_si128(src_ptr.add(offset).cast());
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), scale_ssse3(x, &narrow));
+        }
+        offset += 16;
+    }
+    // Both steps above are a whole number of elements, so the tail starts on
+    // an element boundary.
     mul_into_scalar(&mut dst[offset..len], tables.coeff, &src[offset..len]);
 }
 
 /// Nibble tables and lane masks for one coefficient, held in SSE registers.
-struct NibbleSsse3 {
+pub(crate) struct NibbleSsse3 {
     /// Low-nibble table of factor `i`.
-    lo: [__m128i; 4],
+    pub(crate) lo: [__m128i; 4],
     /// High-nibble table of factor `i`.
-    hi: [__m128i; 4],
+    pub(crate) hi: [__m128i; 4],
     /// `0x0f` in every byte: the nibble-extraction mask.
-    nibble: __m128i,
+    pub(crate) nibble: __m128i,
     /// `0x00ff` in every halfword: selects each element's even (low) byte.
-    even: __m128i,
+    pub(crate) even: __m128i,
     /// Adjacent-byte exchange control.
-    swap: __m128i,
+    pub(crate) swap: __m128i,
 }
 
-/// Load the 16-byte tables of `tables` into SSE registers.
+/// Load the 16-byte factor tables of `tables` into SSE registers.
+///
+/// Generic over [`NibbleFactors`]; see [`nibble_avx2`].
 #[inline]
 #[target_feature(enable = "ssse3")]
-fn nibble_ssse3(tables: &TowerTables) -> NibbleSsse3 {
+pub(crate) fn nibble_ssse3<T: NibbleFactors>(tables: &T) -> NibbleSsse3 {
     let mut lo = [_mm_setzero_si128(); 4];
     let mut hi = [_mm_setzero_si128(); 4];
-    for (slot, factor) in tables.factors.iter().enumerate() {
-        // SAFETY: `lo` and `hi` are `[u8; 16]`, exactly the width of the load.
+    for slot in 0..4 {
+        // SAFETY: `lo`/`hi` entries are `[u8; 16]`, exactly the width of the
+        // load.
         unsafe {
-            lo[slot] = _mm_loadu_si128(factor.lo.as_ptr().cast());
-            hi[slot] = _mm_loadu_si128(factor.hi.as_ptr().cast());
+            lo[slot] = _mm_loadu_si128(tables.lo(slot).as_ptr().cast());
+            hi[slot] = _mm_loadu_si128(tables.hi(slot).as_ptr().cast());
         }
     }
     NibbleSsse3 {
@@ -498,7 +652,7 @@ fn nibble_ssse3(tables: &TowerTables) -> NibbleSsse3 {
 /// Split `value` into its low and high nibbles, both as byte indices.
 #[inline]
 #[target_feature(enable = "ssse3")]
-fn split_ssse3(value: __m128i, nibble: __m128i) -> (__m128i, __m128i) {
+pub(crate) fn split_ssse3(value: __m128i, nibble: __m128i) -> (__m128i, __m128i) {
     (
         _mm_and_si128(value, nibble),
         _mm_and_si128(_mm_srli_epi16(value, 4), nibble),
@@ -508,14 +662,14 @@ fn split_ssse3(value: __m128i, nibble: __m128i) -> (__m128i, __m128i) {
 /// One base-field byte multiply: two table lookups over pre-split nibbles.
 #[inline]
 #[target_feature(enable = "ssse3")]
-fn lookup_ssse3(lo: __m128i, hi: __m128i, split: (__m128i, __m128i)) -> __m128i {
+pub(crate) fn lookup_ssse3(lo: __m128i, hi: __m128i, split: (__m128i, __m128i)) -> __m128i {
     _mm_xor_si128(_mm_shuffle_epi8(lo, split.0), _mm_shuffle_epi8(hi, split.1))
 }
 
 /// `coeff * src` for one 16-byte lane, via four nibble-shuffle multiplies.
 #[inline]
 #[target_feature(enable = "ssse3")]
-fn scale_ssse3(src: __m128i, tables: &NibbleSsse3) -> __m128i {
+pub(crate) fn scale_ssse3(src: __m128i, tables: &NibbleSsse3) -> __m128i {
     let swapped = _mm_shuffle_epi8(src, tables.swap);
     let direct = split_ssse3(src, tables.nibble);
     let crossed = split_ssse3(swapped, tables.nibble);
@@ -594,6 +748,13 @@ unsafe fn mul_assign_ssse3_impl(dst: &mut [u8], tables: &TowerTables) {
 ///
 /// Fused form of copy-then-scale: the `mul_add` body without the destination
 /// read, one pass.
+///
+/// Unlike the GFNI and AVX2 forms this keeps ordinary stores at every size.
+/// Non-temporal stores only pay when the loop is store-bound, and this one is
+/// not: eight `PSHUFB` per 16 bytes hold it well under the host's write
+/// bandwidth, and 16-byte non-temporal stores from a slow loop flush
+/// write-combining buffers before a line fills. The GF(2^8) SSSE3 kernel does
+/// reach the ceiling and does use them. See BENCHMARKS.md.
 pub fn mul_into_ssse3(dst: &mut [u8], tables: &TowerTables, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the SSSE3 backend; `dst` and `src` are
@@ -715,7 +876,17 @@ unsafe fn scatter_group_gfni<const N: usize>(
     }
 
     let src_ptr = src.as_ptr();
-    let mut offset = 0;
+    // Bring the destinations to a 32-byte boundary; see `peel_to_align`.
+    let head = super::peel_to_align(rows[0], span, 2);
+    for (k, &coeff) in coeffs.iter().enumerate() {
+        // SAFETY: `head <= span`, so `0..head` lies inside every row, and the
+        // peel is a whole number of elements.
+        unsafe {
+            let lead = core::slice::from_raw_parts_mut(rows[k], head);
+            mul_add_gfni_impl(lead, TowerCoeff::new(coeff), &src[..head]);
+        }
+    }
+    let mut offset = head;
     while offset + 32 <= span {
         // SAFETY: `offset + 32 <= span <= src.len()` bounds the source load.
         let x = unsafe { _mm256_loadu_si256(src_ptr.add(offset).cast()) };
@@ -809,6 +980,13 @@ unsafe fn matrix_gfni_impl<M: Matrix<Elem> + ?Sized>(
 /// Fold every term into `N` consecutive rows starting at `base`, which is row
 /// `first` of the destination.
 ///
+/// No destination alignment peel, unlike [`scatter_group_gfni`]. The peel pays
+/// there because a scatter loads and stores every row once per 32-byte source
+/// window; here the row tile is loaded and stored once per *term block*, so a
+/// straddling access is amortized over eight multiplies and the loop is
+/// compute-bound rather than traffic-bound. Adding the peel here measured as
+/// noise at best (BENCHMARKS.md).
+///
 /// # Safety
 /// AVX2 and GFNI must be available, the `N` rows at `base + k * stride` must
 /// be readable and writable for `span` bytes, every term must supply more
@@ -841,7 +1019,6 @@ unsafe fn matrix_group_gfni<const N: usize, M: Matrix<Elem> + ?Sized>(
                 *slot = broadcast_words(TowerCoeff::new(coeff));
             }
         }
-
         let mut offset = 0;
         while offset + 32 <= span {
             let mut acc = [_mm256_setzero_si256(); N];
@@ -942,7 +1119,256 @@ unsafe fn elementwise_gfni_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
     }
 }
 
+/// `DELTA * v` for every byte lane, by split-nibble `PSHUFB`.
+///
+/// The tower product needs one multiply by the *constant* `DELTA`, which —
+/// unlike the two varying-operand products around it — does have a nibble
+/// table. Two shuffles beat eight shift/reduce rounds.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn scale_delta_avx2(v: __m256i, lo: __m256i, hi: __m256i, nibble: __m256i) -> __m256i {
+    _mm256_xor_si256(
+        _mm256_shuffle_epi8(lo, _mm256_and_si256(v, nibble)),
+        _mm256_shuffle_epi8(hi, _mm256_and_si256(_mm256_srli_epi16::<4>(v), nibble)),
+    )
+}
+
+/// The 16-byte form of [`scale_delta_avx2`].
+#[inline]
+#[target_feature(enable = "ssse3")]
+fn scale_delta_sse(v: __m128i, lo: __m128i, hi: __m128i, nibble: __m128i) -> __m128i {
+    _mm_xor_si128(
+        _mm_shuffle_epi8(lo, _mm_and_si128(v, nibble)),
+        _mm_shuffle_epi8(hi, _mm_and_si128(_mm_srli_epi16::<4>(v), nibble)),
+    )
+}
+
+/// `dst[i] = a[i] * b[i]` over interleaved tower elements, AVX2.
+///
+/// Three base products, as everywhere else: `direct = [ac, bd]`,
+/// `crossed = [ad, bc]`, and `DELTA*bd`. The first two have two varying
+/// operands and use the shift/reduce vector multiply from
+/// [`super::gf8`]; the third is a constant multiply and stays a nibble
+/// shuffle.
+pub fn elementwise_avx2(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    debug_assert_eq!(dst.len(), a.len());
+    debug_assert_eq!(dst.len(), b.len());
+    // SAFETY: the selected backend guarantees AVX2, and all three lengths
+    // match.
+    unsafe { elementwise_avx2_impl(dst, a, b) }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn elementwise_avx2_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    let len = dst.len().min(a.len()).min(b.len()) & !31;
+    let (dst_ptr, a_ptr, b_ptr) = (dst.as_mut_ptr(), a.as_ptr(), b.as_ptr());
+    let swap = swap_mask256();
+    let even = _mm256_set1_epi16(0x00ff);
+    let nibble = _mm256_set1_epi8(0x0f);
+    let delta = scale_table(crate::field::gf16::DELTA);
+    // SAFETY: `lo` and `hi` are 16-byte arrays, exactly one `__m128i` each.
+    let (delta_lo, delta_hi) = unsafe {
+        (
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(delta.lo.as_ptr().cast())),
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(delta.hi.as_ptr().cast())),
+        )
+    };
+    let mut offset = 0;
+    while offset < len {
+        // SAFETY: `offset + 32 <= len`, which bounds all three slices.
+        unsafe {
+            let x = _mm256_loadu_si256(a_ptr.add(offset).cast());
+            let y = _mm256_loadu_si256(b_ptr.add(offset).cast());
+            let direct = super::gf8::multiply_vectors_avx2(x, y);
+            let crossed = super::gf8::multiply_vectors_avx2(x, _mm256_shuffle_epi8(y, swap));
+            let delta_bd = scale_delta_avx2(
+                _mm256_shuffle_epi8(direct, swap),
+                delta_lo,
+                delta_hi,
+                nibble,
+            );
+            let constant = _mm256_xor_si256(direct, delta_bd);
+            let cross_sum = _mm256_xor_si256(crossed, _mm256_shuffle_epi8(crossed, swap));
+            let extension = _mm256_xor_si256(cross_sum, direct);
+            let product = _mm256_xor_si256(
+                _mm256_and_si256(constant, even),
+                _mm256_andnot_si256(even, extension),
+            );
+            _mm256_storeu_si256(dst_ptr.add(offset).cast(), product);
+        }
+        offset += 32;
+    }
+    // SAFETY: AVX2 implies SSSE3, and the remainders keep equal lengths.
+    unsafe { elementwise_ssse3_impl(&mut dst[len..], &a[len..], &b[len..]) }
+}
+
+/// `dst[i] = a[i] * b[i]` over interleaved tower elements, SSSE3.
+pub fn elementwise_ssse3(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    debug_assert_eq!(dst.len(), a.len());
+    debug_assert_eq!(dst.len(), b.len());
+    // SAFETY: the selected backend guarantees SSSE3, and all three lengths
+    // match.
+    unsafe { elementwise_ssse3_impl(dst, a, b) }
+}
+
+#[inline]
+#[target_feature(enable = "ssse3")]
+unsafe fn elementwise_ssse3_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    let len = dst.len().min(a.len()).min(b.len()) & !15;
+    let (dst_ptr, a_ptr, b_ptr) = (dst.as_mut_ptr(), a.as_ptr(), b.as_ptr());
+    let swap = swap_mask128();
+    let even = _mm_set1_epi16(0x00ff);
+    let nibble = _mm_set1_epi8(0x0f);
+    let delta = scale_table(crate::field::gf16::DELTA);
+    // SAFETY: `lo` and `hi` are 16-byte arrays, exactly one `__m128i` each.
+    let (delta_lo, delta_hi) = unsafe {
+        (
+            _mm_loadu_si128(delta.lo.as_ptr().cast()),
+            _mm_loadu_si128(delta.hi.as_ptr().cast()),
+        )
+    };
+    let mut offset = 0;
+    while offset < len {
+        // SAFETY: `offset + 16 <= len`, which bounds all three slices.
+        unsafe {
+            let x = _mm_loadu_si128(a_ptr.add(offset).cast());
+            let y = _mm_loadu_si128(b_ptr.add(offset).cast());
+            let direct = super::gf8::multiply_vectors_sse(x, y);
+            let crossed = super::gf8::multiply_vectors_sse(x, _mm_shuffle_epi8(y, swap));
+            let delta_bd =
+                scale_delta_sse(_mm_shuffle_epi8(direct, swap), delta_lo, delta_hi, nibble);
+            let constant = _mm_xor_si128(direct, delta_bd);
+            let cross_sum = _mm_xor_si128(crossed, _mm_shuffle_epi8(crossed, swap));
+            let extension = _mm_xor_si128(cross_sum, direct);
+            let product = _mm_xor_si128(
+                _mm_and_si128(constant, even),
+                _mm_andnot_si128(even, extension),
+            );
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), product);
+        }
+        offset += 16;
+    }
+    for ((d, x), y) in dst[len..]
+        .chunks_exact_mut(2)
+        .zip(a[len..].chunks_exact(2))
+        .zip(b[len..].chunks_exact(2))
+    {
+        d.copy_from_slice(
+            &Elem::from_bytes([x[0], x[1]])
+                .mul(Elem::from_bytes([y[0], y[1]]))
+                .to_bytes(),
+        );
+    }
+}
+
 const TERM_TILE: usize = 8;
+
+/// How many sources [`gather_gfni`] folds into its accumulator at once.
+///
+/// A GFNI coefficient is two broadcast vectors, so four sources occupy eight
+/// of the sixteen AVX2 registers and leave room for the accumulator, the
+/// exchange control and the multiply temporaries. Folding *every* source in
+/// one pass cannot: a variable coefficient count has no register home at all,
+/// so the broadcasts end up re-derived inside the byte loop.
+const SOURCE_GROUP: usize = 4;
+
+/// Lane constants every AVX2 nibble multiply needs, materialized once per
+/// kernel call.
+///
+/// [`NibbleAvx2`] carries its own copy, which suits the single-coefficient
+/// kernels: there is exactly one table set, so the constants ride along for
+/// free. The blocked kernels hold state per *live coefficient*, and three of
+/// every eleven vectors would then be the same constant over again. Split
+/// out, only the eight vectors that genuinely differ scale with the block.
+struct LaneAvx2 {
+    /// `0x0f` in every byte: the nibble-extraction mask.
+    nibble: __m256i,
+    /// `0x00ff` in every halfword: selects each element's even (low) byte.
+    even: __m256i,
+    /// Adjacent-byte exchange control.
+    swap: __m256i,
+}
+
+/// Materialize the shared lane constants.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn lane_avx2() -> LaneAvx2 {
+    LaneAvx2 {
+        nibble: _mm256_set1_epi8(0x0f),
+        even: _mm256_set1_epi16(0x00ff),
+        swap: swap_mask256(),
+    }
+}
+
+/// One source vector reduced to everything that does not depend on the
+/// coefficient applied to it.
+///
+/// This is what pays for a blocked tile. [`scale_avx2`] redoes the adjacent
+/// exchange and both nibble splits for every coefficient; a tile that folds
+/// one source into several rows derives them once here and hands the same
+/// four index vectors to every row.
+struct SplitAvx2 {
+    /// Low and high nibbles of the source.
+    direct: (__m256i, __m256i),
+    /// Low and high nibbles of the adjacent-exchanged source.
+    crossed: (__m256i, __m256i),
+}
+
+/// Exchange and split `src` once for a whole tile.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn split_source_avx2(src: __m256i, lanes: &LaneAvx2) -> SplitAvx2 {
+    SplitAvx2 {
+        direct: split_avx2(src, lanes.nibble),
+        crossed: split_avx2(_mm256_shuffle_epi8(src, lanes.swap), lanes.nibble),
+    }
+}
+
+/// One base-field byte multiply, broadcasting a shared bank entry at the
+/// point of use.
+///
+/// The blocked kernels keep four such borrows per live coefficient rather
+/// than [`NibbleAvx2`]'s eleven vectors: the bank is rodata that is already
+/// resident and shared by every coefficient with a factor in common, so the
+/// state that scales with the block stays at four pointers.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn lookup_bank_avx2(factor: &ScaleTable, split: (__m256i, __m256i)) -> __m256i {
+    // SAFETY: `lo` and `hi` are `[u8; 16]`, exactly the width of each load.
+    let (lo, hi) = unsafe {
+        (
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(factor.lo.as_ptr().cast())),
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(factor.hi.as_ptr().cast())),
+        )
+    };
+    lookup_avx2(lo, hi, split)
+}
+
+/// `coeff * src` for one 32-byte lane, over a source already exchanged and
+/// split by [`split_source_avx2`].
+///
+/// The same four nibble multiplies and the same parity-before-mask grouping
+/// as [`scale_avx2`]; only the coefficient-independent prologue is gone.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn scale_split_avx2(
+    split: &SplitAvx2,
+    factors: &[&'static ScaleTable; 4],
+    even_mask: __m256i,
+) -> __m256i {
+    let even = _mm256_xor_si256(
+        lookup_bank_avx2(factors[0], split.direct),
+        lookup_bank_avx2(factors[2], split.crossed),
+    );
+    let odd = _mm256_xor_si256(
+        lookup_bank_avx2(factors[1], split.direct),
+        lookup_bank_avx2(factors[3], split.crossed),
+    );
+    _mm256_xor_si256(
+        _mm256_and_si256(even, even_mask),
+        _mm256_andnot_si256(even_mask, odd),
+    )
+}
 
 /// Many sources into one destination, eight coefficients prepared per pass.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -956,20 +1382,26 @@ pub fn gather_avx2<C: TableCoefficient>(dst: &mut [u8], coeffs: &[C], srcs: &[&[
 #[target_feature(enable = "avx2")]
 unsafe fn gather_avx2_impl<C: TableCoefficient>(dst: &mut [u8], coeffs: &[C], srcs: &[&[u8]]) {
     let vector_len = dst.len() & !31;
+    let lanes = lane_avx2();
     for block in (0..coeffs.len()).step_by(TERM_TILE) {
         let count = (coeffs.len() - block).min(TERM_TILE);
-        let vectors: [NibbleAvx2; TERM_TILE] = core::array::from_fn(|i| {
-            coeffs[block + i.min(count - 1)].with_tables(|tables| nibble_avx2(tables))
-        });
+        // Four bank borrows per coefficient, resolved once per block. The
+        // earlier shape widened each into a full `NibbleAvx2` here — eighty-
+        // eight vectors against a sixteen-register file, so every tile read
+        // the whole block back off the stack.
+        let factors: [[&'static ScaleTable; 4]; TERM_TILE] =
+            core::array::from_fn(|i| factor_tables(coeffs[block + i.min(count - 1)].coefficient()));
         let mut offset = 0;
         while offset < vector_len {
-            // SAFETY: this 32-byte window lies within `dst`.
+            // SAFETY: `offset + 32 <= vector_len <= dst.len()`.
             let mut acc = unsafe { _mm256_loadu_si256(dst.as_ptr().add(offset).cast()) };
-            for i in 0..count {
-                // SAFETY: every source has `dst.len()` bytes.
+            for (i, factor) in factors.iter().take(count).enumerate() {
+                // SAFETY: every source has `dst.len()` bytes, so this window
+                // is the one just loaded from `dst`.
                 let source =
                     unsafe { _mm256_loadu_si256(srcs[block + i].as_ptr().add(offset).cast()) };
-                acc = _mm256_xor_si256(acc, scale_avx2(source, &vectors[i]));
+                let split = split_source_avx2(source, &lanes);
+                acc = _mm256_xor_si256(acc, scale_split_avx2(&split, factor, lanes.even));
             }
             // SAFETY: the destination window loaded above.
             unsafe { _mm256_storeu_si256(dst.as_mut_ptr().add(offset).cast(), acc) };
@@ -1024,42 +1456,93 @@ unsafe fn gather_ssse3_impl<C: TableCoefficient>(dst: &mut [u8], coeffs: &[C], s
     }
 }
 
-/// GFNI gather: all coefficients remain compact, so one pass can fold every
-/// source without term blocking.
-#[cfg_attr(not(test), allow(dead_code))]
+/// GFNI gather: a coefficient is two broadcast vectors, so sources are folded
+/// four at a time.
+///
+/// Every broadcast of a group is derived once and stays in a register for the
+/// whole pass, and the destination is read and written once per group instead
+/// of once per source. Folding all sources in a single pass, as this kernel
+/// first did, cannot keep a variable number of broadcasts anywhere, so it
+/// paid two base multiplies and two `vpbroadcastw` per source per tile.
 pub fn gather_gfni(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
     // SAFETY: the selected backend guarantees AVX2 and GFNI.
     unsafe { gather_gfni_impl(dst, coeffs, srcs) }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "avx2,gfni")]
 unsafe fn gather_gfni_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     let vector_len = dst.len() & !31;
     let swap = swap_mask256();
+    let mut i = 0;
+    while i + SOURCE_GROUP <= coeffs.len() {
+        let mut group = [Elem(0); SOURCE_GROUP];
+        group.copy_from_slice(&coeffs[i..i + SOURCE_GROUP]);
+        let mut sources: [&[u8]; SOURCE_GROUP] = [&[]; SOURCE_GROUP];
+        sources.copy_from_slice(&srcs[i..i + SOURCE_GROUP]);
+        // SAFETY: AVX2 and GFNI are present, `vector_len` is a 32-byte
+        // multiple of `dst.len()`, and every source is `dst.len()` bytes.
+        unsafe { gather_group_gfni(dst, vector_len, group, sources, swap) };
+        i += SOURCE_GROUP;
+    }
+    if i + 2 <= coeffs.len() {
+        let mut group = [Elem(0); 2];
+        group.copy_from_slice(&coeffs[i..i + 2]);
+        let mut sources: [&[u8]; 2] = [&[]; 2];
+        sources.copy_from_slice(&srcs[i..i + 2]);
+        // SAFETY: as above, for the two-source remainder.
+        unsafe { gather_group_gfni(dst, vector_len, group, sources, swap) };
+        i += 2;
+    }
+    if i < coeffs.len() {
+        // SAFETY: AVX2 and GFNI are present and the last source spans `dst`;
+        // the unrolled single-coefficient kernel is the better shape for it.
+        unsafe { mul_add_gfni_impl(dst, TowerCoeff::new(coeffs[i]), srcs[i]) };
+    }
+}
+
+/// Fold `N` sources into `dst` in one pass over the destination.
+///
+/// # Safety
+/// AVX2 and GFNI must be available, `vector_len` must be a multiple of 32 and
+/// at most `dst.len()`, and every source must be exactly `dst.len()` bytes.
+#[target_feature(enable = "avx2,gfni")]
+unsafe fn gather_group_gfni<const N: usize>(
+    dst: &mut [u8],
+    vector_len: usize,
+    coeffs: [Elem; N],
+    srcs: [&[u8]; N],
+    swap: __m256i,
+) {
+    // Derived once per group, never inside the byte loop. `N` is a constant,
+    // so these `2 * N` vectors have a register home for the whole pass.
+    let mut same = [_mm256_setzero_si256(); N];
+    let mut cross = [_mm256_setzero_si256(); N];
+    for (k, &coeff) in coeffs.iter().enumerate() {
+        let (same_word, cross_word) = broadcast_words(TowerCoeff::new(coeff));
+        same[k] = _mm256_set1_epi16(same_word);
+        cross[k] = _mm256_set1_epi16(cross_word);
+    }
+
+    let dst_ptr = dst.as_mut_ptr();
     let mut offset = 0;
     while offset < vector_len {
-        // SAFETY: this 32-byte window lies within `dst`.
-        let mut acc = unsafe { _mm256_loadu_si256(dst.as_ptr().add(offset).cast()) };
-        for (&coeff, &src) in coeffs.iter().zip(srcs) {
-            let compact = TowerCoeff::new(coeff);
-            let (same_word, cross_word) = broadcast_words(compact);
-            let same = _mm256_set1_epi16(same_word);
-            let cross = _mm256_set1_epi16(cross_word);
-            // SAFETY: every source has `dst.len()` bytes.
-            let source = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast()) };
-            acc = _mm256_xor_si256(
-                acc,
-                scale_gfni(source, _mm256_shuffle_epi8(source, swap), same, cross),
-            );
+        // SAFETY: `offset + 32 <= vector_len <= dst.len()`.
+        let mut acc = unsafe { _mm256_loadu_si256(dst_ptr.add(offset).cast()) };
+        for (k, &src) in srcs.iter().enumerate() {
+            // SAFETY: source `k` is `dst.len()` bytes, so it covers exactly
+            // the window the destination load above used.
+            let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast()) };
+            let swapped = _mm256_shuffle_epi8(x, swap);
+            acc = _mm256_xor_si256(acc, scale_gfni(x, swapped, same[k], cross[k]));
         }
         // SAFETY: the destination window loaded above.
-        unsafe { _mm256_storeu_si256(dst.as_mut_ptr().add(offset).cast(), acc) };
+        unsafe { _mm256_storeu_si256(dst_ptr.add(offset).cast(), acc) };
         offset += 32;
     }
-    for (&coeff, &src) in coeffs.iter().zip(srcs) {
-        mul_add_scalar(&mut dst[vector_len..], coeff, &src[vector_len..]);
+
+    for (k, &coeff) in coeffs.iter().enumerate() {
+        mul_add_scalar(&mut dst[vector_len..], coeff, &srcs[k][vector_len..]);
     }
 }
 
@@ -1084,15 +1567,27 @@ unsafe fn scatter_avx2_impl<C: TableCoefficient>(
     if row_len == 0 {
         return;
     }
-    let vector_len = row_len & !31;
     let base = rows.as_mut_ptr();
     for group in (0..coeffs.len()).step_by(4) {
         let count = (coeffs.len() - group).min(4);
         let vectors: [NibbleAvx2; 4] = core::array::from_fn(|i| {
             coeffs[group + i.min(count - 1)].with_tables(|tables| nibble_avx2(tables))
         });
-        let mut offset = 0;
-        while offset < vector_len {
+        // Bring this group's rows to a 32-byte boundary; see `peel_to_align`.
+        // SAFETY: row `group` is in bounds, and `head <= row_len`.
+        let head = unsafe { super::peel_to_align(base.add(group * row_len), row_len, 2) };
+        for slot in 0..count {
+            // SAFETY: `head` bytes from the start of row `group + slot`, which
+            // is in bounds, and the peel is a whole number of elements.
+            unsafe {
+                let lead =
+                    core::slice::from_raw_parts_mut(base.add((group + slot) * row_len), head);
+                coeffs[group + slot]
+                    .with_tables(|tables| mul_add_avx2_impl(lead, tables, &src[..head]));
+            }
+        }
+        let mut offset = head;
+        while offset + 32 <= row_len {
             // SAFETY: this source window is in bounds.
             let source = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast()) };
             for (slot, vector) in vectors.iter().take(count).enumerate() {
@@ -1114,16 +1609,21 @@ unsafe fn scatter_avx2_impl<C: TableCoefficient>(
             // SAFETY: this is one row's disjoint scalar tail.
             let tail = unsafe {
                 core::slice::from_raw_parts_mut(
-                    base.add((group + slot) * row_len + vector_len),
-                    row_len - vector_len,
+                    base.add((group + slot) * row_len + offset),
+                    row_len - offset,
                 )
             };
-            mul_add_scalar(tail, coeffs[group + slot].coefficient(), &src[vector_len..]);
+            mul_add_scalar(tail, coeffs[group + slot].coefficient(), &src[offset..]);
         }
     }
 }
 
 /// One source into many rows using four SSSE3 table sets at a time.
+///
+/// No destination alignment peel, unlike [`scatter_avx2`]. A 16-byte access
+/// only straddles a cache line when it is not 16-byte aligned, and every
+/// allocator this runs behind already returns 16-byte-aligned memory, so the
+/// peel has nothing to fix and measured as a small loss (BENCHMARKS.md).
 pub fn scatter_ssse3<C: TableCoefficient>(
     rows: &mut [u8],
     row_len: usize,
@@ -1144,7 +1644,6 @@ unsafe fn scatter_ssse3_impl<C: TableCoefficient>(
     if row_len == 0 {
         return;
     }
-    let vector_len = row_len & !15;
     let base = rows.as_mut_ptr();
     for group in (0..coeffs.len()).step_by(4) {
         let count = (coeffs.len() - group).min(4);
@@ -1152,7 +1651,7 @@ unsafe fn scatter_ssse3_impl<C: TableCoefficient>(
             coeffs[group + i.min(count - 1)].with_tables(|tables| nibble_ssse3(tables))
         });
         let mut offset = 0;
-        while offset < vector_len {
+        while offset + 16 <= row_len {
             // SAFETY: this source window is in bounds.
             let source = unsafe { _mm_loadu_si128(src.as_ptr().add(offset).cast()) };
             for (slot, vector) in vectors.iter().take(count).enumerate() {
@@ -1171,11 +1670,11 @@ unsafe fn scatter_ssse3_impl<C: TableCoefficient>(
             // SAFETY: this is one row's disjoint scalar tail.
             let tail = unsafe {
                 core::slice::from_raw_parts_mut(
-                    base.add((group + slot) * row_len + vector_len),
-                    row_len - vector_len,
+                    base.add((group + slot) * row_len + offset),
+                    row_len - offset,
                 )
             };
-            mul_add_scalar(tail, coeffs[group + slot].coefficient(), &src[vector_len..]);
+            mul_add_scalar(tail, coeffs[group + slot].coefficient(), &src[offset..]);
         }
     }
 }
@@ -1208,56 +1707,105 @@ unsafe fn matrix_avx2_impl<C: TableCoefficient, M: Matrix<C> + ?Sized>(
     if row_len == 0 {
         return;
     }
-    let vector_len = row_len & !31;
     let base = rows.as_mut_ptr();
-    for group in (0..nrows).step_by(4) {
-        let row_count = (nrows - group).min(4);
-        for block in (0..terms.len()).step_by(TERM_TILE) {
-            let term_count = (terms.len() - block).min(TERM_TILE);
-            let vectors: [[NibbleAvx2; 4]; TERM_TILE] = core::array::from_fn(|t| {
-                core::array::from_fn(|r| {
-                    terms
-                        .coefficient(block + t.min(term_count - 1), group + r.min(row_count - 1))
-                        .with_tables(|tables| nibble_avx2(tables))
-                })
-            });
-            let mut offset = 0;
-            while offset < vector_len {
-                let mut acc = [_mm256_setzero_si256(); 4];
-                // SAFETY: every selected row contains this window.
-                unsafe {
-                    for (r, slot) in acc.iter_mut().take(row_count).enumerate() {
-                        *slot = _mm256_loadu_si256(base.add((group + r) * row_len + offset).cast());
-                    }
-                }
-                for (t, vector) in vectors.iter().take(term_count).enumerate() {
-                    let source = unsafe {
-                        _mm256_loadu_si256(terms.source(block + t).as_ptr().add(offset).cast())
-                    };
-                    for (value, scale) in acc.iter_mut().zip(vector).take(row_count) {
-                        *value = _mm256_xor_si256(*value, scale_avx2(source, scale));
-                    }
-                }
-                // SAFETY: the same disjoint row windows loaded above.
-                unsafe {
-                    for (r, &slot) in acc.iter().take(row_count).enumerate() {
-                        _mm256_storeu_si256(base.add((group + r) * row_len + offset).cast(), slot);
-                    }
-                }
-                offset += 32;
+    let lanes = lane_avx2();
+    let mut j = 0;
+    while j + 4 <= nrows {
+        // SAFETY: rows `j..j + 4` lie within `rows` and, being `row_len` bytes
+        // apart with a `row_len` window, are pairwise disjoint.
+        unsafe { matrix_group_avx2::<4, C, M>(base.add(j * row_len), row_len, j, terms, &lanes) };
+        j += 4;
+    }
+    if j + 2 <= nrows {
+        // SAFETY: as above, for the two-row remainder.
+        unsafe { matrix_group_avx2::<2, C, M>(base.add(j * row_len), row_len, j, terms, &lanes) };
+        j += 2;
+    }
+    if j < nrows {
+        // SAFETY: as above, for the final row.
+        unsafe { matrix_group_avx2::<1, C, M>(base.add(j * row_len), row_len, j, terms, &lanes) };
+    }
+}
+
+/// Fold every term into `N` consecutive rows starting at `base`, which is row
+/// `first` of the destination.
+///
+/// The tile's source is exchanged and split once per term and all `N` rows
+/// consume the same index vectors. That prologue is the only part of the
+/// multiply independent of the coefficient, and a four-row group used to
+/// repeat it four times. What still varies per row is four borrows into the
+/// shared bank, not the eleven live vectors a `NibbleAvx2` per (term, row)
+/// demanded — that array was the spill.
+///
+/// # Safety
+/// AVX2 must be available, the `N` rows at `base + k * row_len` must be
+/// readable and writable for `row_len` bytes, every term must supply more
+/// than `first + N - 1` coefficients, and no term's source may be shorter
+/// than `row_len`.
+#[target_feature(enable = "avx2")]
+unsafe fn matrix_group_avx2<const N: usize, C: TableCoefficient, M: Matrix<C> + ?Sized>(
+    base: *mut u8,
+    row_len: usize,
+    first: usize,
+    terms: &M,
+    lanes: &LaneAvx2,
+) {
+    let vector_len = row_len & !31;
+    let mut rows = [core::ptr::null_mut::<u8>(); N];
+    for (k, row) in rows.iter_mut().enumerate() {
+        // SAFETY: the caller guarantees all `N` rows are in bounds.
+        *row = unsafe { base.add(k * row_len) };
+    }
+
+    for block in (0..terms.len()).step_by(TERM_TILE) {
+        let block_len = (terms.len() - block).min(TERM_TILE);
+        // Every coefficient of the block is resolved exactly once, here,
+        // outside the byte loop — and to four pointers, so the block's live
+        // state is bytes rather than a stack frame of widened tables.
+        let factors: [[[&'static ScaleTable; 4]; N]; TERM_TILE] = core::array::from_fn(|t| {
+            core::array::from_fn(|k| {
+                let coeff = terms.coefficient(block + t.min(block_len - 1), first + k);
+                factor_tables(coeff.coefficient())
+            })
+        });
+
+        let mut offset = 0;
+        while offset < vector_len {
+            let mut acc = [_mm256_setzero_si256(); N];
+            for (k, a) in acc.iter_mut().enumerate() {
+                // SAFETY: `offset + 32 <= vector_len <= row_len`, so this
+                // window lies inside row `k`.
+                *a = unsafe { _mm256_loadu_si256(rows[k].add(offset).cast()) };
             }
-            for r in 0..row_count {
-                // SAFETY: this is one row's disjoint scalar tail.
-                let tail = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        base.add((group + r) * row_len + vector_len),
-                        row_len - vector_len,
-                    )
+            for (t, row_factors) in factors.iter().take(block_len).enumerate() {
+                // SAFETY: `offset + 32 <= vector_len <= row_len` and no term's
+                // source is shorter than `row_len`.
+                let source = unsafe {
+                    _mm256_loadu_si256(terms.source(block + t).as_ptr().add(offset).cast())
                 };
-                for term in block..block + term_count {
+                let split = split_source_avx2(source, lanes);
+                for (a, factor) in acc.iter_mut().zip(row_factors) {
+                    *a = _mm256_xor_si256(*a, scale_split_avx2(&split, factor, lanes.even));
+                }
+            }
+            for (k, &a) in acc.iter().enumerate() {
+                // SAFETY: same bound and disjointness as the matching load.
+                unsafe { _mm256_storeu_si256(rows[k].add(offset).cast(), a) };
+            }
+            offset += 32;
+        }
+
+        if vector_len < row_len {
+            for (k, &row) in rows.iter().enumerate() {
+                // SAFETY: `vector_len..row_len` is the untouched tail of row
+                // `k`, and 32-byte steps leave it on an element boundary.
+                let tail = unsafe {
+                    core::slice::from_raw_parts_mut(row.add(vector_len), row_len - vector_len)
+                };
+                for term in block..block + block_len {
                     mul_add_scalar(
                         tail,
-                        terms.coefficient(term, group + r).coefficient(),
+                        terms.coefficient(term, first + k).coefficient(),
                         &terms.source(term)[vector_len..],
                     );
                 }

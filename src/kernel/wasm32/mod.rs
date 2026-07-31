@@ -14,6 +14,9 @@ use core::arch::wasm32::*;
 use crate::kernel::scalar;
 
 /// `dst ^= src` over 16-byte Wasm SIMD lanes.
+///
+/// # Panics
+/// If `dst` and `src` have different lengths.
 pub fn xor_simd128(dst: &mut [u8], src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: this module is reachable only in a `+simd128` build, and the

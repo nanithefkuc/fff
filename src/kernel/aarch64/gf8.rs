@@ -625,7 +625,7 @@ unsafe fn gather_impl(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
 
 /// Lane-parallel GF(2^8) multiplication for two varying byte vectors.
 ///
-/// `PMULL` is in AArch64's optional crypto extension, not baseline NEON, so
+/// `PMULL` is in `AArch64`'s optional crypto extension, not baseline NEON, so
 /// the portable NEON backend uses eight branchless shift/reduce rounds. Every
 /// round processes all 16 lanes and the scalar tail is shorter than one lane.
 #[inline]
@@ -676,7 +676,19 @@ pub(super) fn multiply_vectors_pmull(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t
     )
 }
 
-/// `dst[i] = a[i] * b[i]` using the optional AArch64 crypto extension.
+// Why there is no fixed-coefficient `PMULL` kernel here.
+//
+// A broadcast coefficient makes PMULL table-free, which looks attractive next
+// to a `ScaleTable`. It was written, measured, and lost by a wide margin at
+// every size, for both GF(2^8) and the GF(2^16) tower form (BENCHMARKS.md).
+// The arithmetic explains it — two `vmull_p8`s plus a twenty-instruction
+// reduction network per 16 bytes against `vqtbl1q_u8`'s five — and no core
+// makes PMULL fast enough to close a gap that large.
+// The only shape where that reduction is cheaper than the alternative is a
+// *varying* operand pair, where the alternative is eight bit-serial rounds:
+// hence `elementwise_pmull` below, and nothing else.
+
+/// `dst[i] = a[i] * b[i]` using the optional `AArch64` crypto extension.
 pub fn elementwise_pmull(dst: &mut [u8], a: &[u8], b: &[u8]) {
     debug_assert_eq!(dst.len(), a.len());
     debug_assert_eq!(dst.len(), b.len());

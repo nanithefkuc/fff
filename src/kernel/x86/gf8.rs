@@ -150,12 +150,24 @@ unsafe fn mul_assign_gfni_impl(dst: &mut [u8], coeff: Elem) {
 pub fn mul_into_gfni(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the GFNI backend, which detected both AVX2
-    // and GFNI; the slices are equal-length and independently borrowed.
-    unsafe { mul_into_gfni_impl(dst, coeff, src) }
+    // and GFNI; the slices are equal-length and independently borrowed, and
+    // `nt_split` returns a 32-byte-aligned split for the non-temporal body.
+    unsafe {
+        match super::nt_split(dst, 1) {
+            Some(peel) => {
+                let (head, body) = dst.split_at_mut(peel);
+                let (src_head, src_body) = src.split_at(peel);
+                mul_into_gfni_impl::<false>(head, coeff, src_head);
+                mul_into_gfni_impl::<true>(body, coeff, src_body);
+                _mm_sfence();
+            }
+            None => mul_into_gfni_impl::<false>(dst, coeff, src),
+        }
+    }
 }
 
 #[target_feature(enable = "avx2,gfni")]
-unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
+unsafe fn mul_into_gfni_impl<const NT: bool>(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     let factor = _mm256_set1_epi8(coeff.0.cast_signed());
     let factor128 = _mm256_castsi256_si128(factor);
     let len = dst.len();
@@ -174,10 +186,10 @@ unsafe fn mul_into_gfni_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
             let r1 = _mm256_gf2p8mul_epi8(_mm256_loadu_si256(sp.add(32).cast()), factor);
             let r2 = _mm256_gf2p8mul_epi8(_mm256_loadu_si256(sp.add(64).cast()), factor);
             let r3 = _mm256_gf2p8mul_epi8(_mm256_loadu_si256(sp.add(96).cast()), factor);
-            _mm256_storeu_si256(dp.cast(), r0);
-            _mm256_storeu_si256(dp.add(32).cast(), r1);
-            _mm256_storeu_si256(dp.add(64).cast(), r2);
-            _mm256_storeu_si256(dp.add(96).cast(), r3);
+            super::store256::<NT>(dp, r0);
+            super::store256::<NT>(dp.add(32), r1);
+            super::store256::<NT>(dp.add(64), r2);
+            super::store256::<NT>(dp.add(96), r3);
         }
         offset += 128;
     }
@@ -299,12 +311,24 @@ unsafe fn mul_add_ssse3_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
 pub fn mul_into_avx2(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the AVX2 backend; the slices are
-    // equal-length and independently borrowed.
-    unsafe { mul_into_avx2_impl(dst, table, src) }
+    // equal-length and independently borrowed, and `nt_split` returns a
+    // 32-byte-aligned split for the non-temporal body.
+    unsafe {
+        match super::nt_split(dst, 1) {
+            Some(peel) => {
+                let (head, body) = dst.split_at_mut(peel);
+                let (src_head, src_body) = src.split_at(peel);
+                mul_into_avx2_impl::<false>(head, table, src_head);
+                mul_into_avx2_impl::<true>(body, table, src_body);
+                _mm_sfence();
+            }
+            None => mul_into_avx2_impl::<false>(dst, table, src),
+        }
+    }
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn mul_into_avx2_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+unsafe fn mul_into_avx2_impl<const NT: bool>(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     // SAFETY: `lo` and `hi` are 16-byte arrays, exactly one `__m128i` each.
     let (lo_tbl, hi_tbl) = unsafe {
         (
@@ -323,13 +347,13 @@ unsafe fn mul_into_avx2_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
             let x = _mm256_loadu_si256(src_ptr.add(offset).cast());
             let lo = _mm256_shuffle_epi8(lo_tbl, _mm256_and_si256(x, mask));
             let hi = _mm256_shuffle_epi8(hi_tbl, _mm256_and_si256(_mm256_srli_epi16::<4>(x), mask));
-            _mm256_storeu_si256(dst_ptr.add(offset).cast(), _mm256_xor_si256(lo, hi));
+            super::store256::<NT>(dst_ptr.add(offset), _mm256_xor_si256(lo, hi));
         }
         offset += 32;
     }
 
     // SAFETY: AVX2 implies SSSE3, and the remainders keep equal lengths.
-    unsafe { mul_into_ssse3_impl(&mut dst[len..], table, &src[len..]) }
+    unsafe { mul_into_ssse3_impl::<false>(&mut dst[len..], table, &src[len..]) }
 }
 
 /// `dst = coeff * dst` by nibble shuffle over 32-byte lanes.
@@ -412,13 +436,26 @@ unsafe fn mul_assign_ssse3_impl(dst: &mut [u8], table: &ScaleTable) {
 pub fn mul_into_ssse3(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     // SAFETY: the caller selected the SSSE3 backend; the slices are
-    // equal-length and independently borrowed.
-    unsafe { mul_into_ssse3_impl(dst, table, src) }
+    // equal-length and independently borrowed, and `nt_split` returns a
+    // 32-byte-aligned — hence 16-byte-aligned — split for the non-temporal
+    // body.
+    unsafe {
+        match super::nt_split(dst, 1) {
+            Some(peel) => {
+                let (head, body) = dst.split_at_mut(peel);
+                let (src_head, src_body) = src.split_at(peel);
+                mul_into_ssse3_impl::<false>(head, table, src_head);
+                mul_into_ssse3_impl::<true>(body, table, src_body);
+                _mm_sfence();
+            }
+            None => mul_into_ssse3_impl::<false>(dst, table, src),
+        }
+    }
 }
 
 #[inline]
 #[target_feature(enable = "ssse3")]
-unsafe fn mul_into_ssse3_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
+unsafe fn mul_into_ssse3_impl<const NT: bool>(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
     // SAFETY: `lo` and `hi` are 16-byte arrays, exactly one `__m128i` each.
     let (lo_tbl, hi_tbl) = unsafe {
         (
@@ -437,7 +474,7 @@ unsafe fn mul_into_ssse3_impl(dst: &mut [u8], table: &ScaleTable, src: &[u8]) {
             let x = _mm_loadu_si128(src_ptr.add(offset).cast());
             let lo = _mm_shuffle_epi8(lo_tbl, _mm_and_si128(x, mask));
             let hi = _mm_shuffle_epi8(hi_tbl, _mm_and_si128(_mm_srli_epi16::<4>(x), mask));
-            _mm_storeu_si128(dst_ptr.add(offset).cast(), _mm_xor_si128(lo, hi));
+            super::store128::<NT>(dst_ptr.add(offset), _mm_xor_si128(lo, hi));
         }
         offset += 16;
     }
@@ -517,33 +554,6 @@ unsafe fn scatter_gfni_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], sr
     }
 }
 
-/// Bytes of scalar lead-in that put a row group's vector accesses on a
-/// 32-byte boundary, or `0` when the row is too short to repay it.
-///
-/// A 32-byte `vmovdqu` at an odd multiple of 32 straddles two cache lines,
-/// and the scatter body issues one load and one store per row per vector: a
-/// misaligned destination therefore doubles the line traffic of eight of the
-/// nine accesses a four-row group makes at each vector position. Measured on
-/// 64 KiB rows the aligned form runs ~1.4x the misaligned one, so peeling at
-/// most 31 bytes per row buys the aligned body for the rest of the pass.
-/// Rows of a group sit `row_len` apart, so aligning one aligns them all
-/// whenever `row_len` is a multiple of 32 — the usual case. The source is
-/// left where it falls: it is the one access against eight, and only the
-/// destination is ours to choose.
-#[inline]
-fn peel_to_align(ptr: *const u8, len: usize) -> usize {
-    // The peel uses 128-bit GFNI where possible and scalar code below one XMM
-    // lane. Keep the conservative crossover measured for the former all-scalar
-    // peel: it won from about 2 KiB up and lost badly below 1 KiB. Sixteen
-    // turns of the 128-byte body remains the floor.
-    const FLOOR: usize = 16 * 128;
-    let head = ptr.align_offset(32);
-    // `align_offset` reports `usize::MAX` only for an unreachable alignment,
-    // which cannot happen for a byte pointer; `head >= len` also covers the
-    // degenerate case of a peel longer than the row.
-    if len < FLOOR || head >= len { 0 } else { head }
-}
-
 /// `rows[i] ^= coeffs[i] * src` for four disjoint rows of `src.len()` bytes.
 #[target_feature(enable = "avx2,gfni")]
 unsafe fn scatter_rows4(ptrs: [*mut u8; 4], coeffs: [Elem; 4], src: &[u8]) {
@@ -558,7 +568,7 @@ unsafe fn scatter_rows4(ptrs: [*mut u8; 4], coeffs: [Elem; 4], src: &[u8]) {
 
     // Bring the destinations to a 32-byte boundary before the vector body
     // starts; see `peel_to_align`.
-    let head = peel_to_align(ptrs[0], len);
+    let head = super::peel_to_align(ptrs[0], len, 1);
     // SAFETY: `head <= len`, the length shared by `src` and every row, so
     // `0..head` is a sub-range of each; the four rows are distinct and
     // in-bounds, and no slice into them is live here.
@@ -628,7 +638,7 @@ unsafe fn scatter_rows2(ptrs: [*mut u8; 2], coeffs: [Elem; 2], src: &[u8]) {
 
     // As in `scatter_rows4`, with four of every five accesses on the
     // destination side.
-    let head = peel_to_align(ptrs[0], len);
+    let head = super::peel_to_align(ptrs[0], len, 1);
     // SAFETY: `head <= len`, the length shared by `src` and both rows, so
     // `0..head` is a sub-range of each; the rows are distinct, in-bounds,
     // and no slice into them is live here.
@@ -747,9 +757,9 @@ unsafe fn scatter_span<'a>(
 /// so testing it where it would have to live — innermost, once per tile — is
 /// pure overhead on a dense matrix, and it costs more than the branch: the
 /// coefficients have to reach a GPR to be tested, which stops each factor
-/// broadcast folding into a memory-operand `vpbroadcastb`. Measured on eight
-/// terms over 64 KiB rows the check cost ~9%. Sparsity belongs in the scatter
-/// shape, which drops zero rows before grouping and outside any loop.
+/// broadcast folding into a memory-operand `vpbroadcastb` (BENCHMARKS.md).
+/// Sparsity belongs in the scatter shape, which drops zero rows before
+/// grouping and outside any loop.
 ///
 /// # Panics
 /// Panics unless `rows` holds `nrows` rows of `row_len` bytes and every term
@@ -1194,6 +1204,112 @@ unsafe fn elementwise_gfni_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
     }
 }
 
+/// Lane-parallel GF(2^8) multiplication of two varying byte vectors.
+///
+/// Without `GF2P8MULB` there is no fixed coefficient to build a nibble table
+/// from, so the product comes from eight branchless shift/reduce rounds — the
+/// sequence already proven on NEON and wasm. x86 has no byte shift: `PADDB`
+/// doubles each lane (a left shift that drops the carry) and the signed
+/// `PCMPGTB` against zero recovers the bit it dropped.
+#[inline]
+#[target_feature(enable = "avx2")]
+pub(super) fn multiply_vectors_avx2(mut a: __m256i, mut b: __m256i) -> __m256i {
+    let zero = _mm256_setzero_si256();
+    let one = _mm256_set1_epi8(1);
+    let reduction = _mm256_set1_epi8(0x1b);
+    let low7 = _mm256_set1_epi8(0x7f);
+    let mut product = zero;
+    for round in 0..8 {
+        let active = _mm256_cmpeq_epi8(_mm256_and_si256(b, one), one);
+        product = _mm256_xor_si256(product, _mm256_and_si256(a, active));
+        if round == 7 {
+            break;
+        }
+        let carry = _mm256_cmpgt_epi8(zero, a);
+        a = _mm256_xor_si256(_mm256_add_epi8(a, a), _mm256_and_si256(reduction, carry));
+        b = _mm256_and_si256(_mm256_srli_epi16::<1>(b), low7);
+    }
+    product
+}
+
+/// The 16-byte form of [`multiply_vectors_avx2`].
+#[inline]
+#[target_feature(enable = "ssse3")]
+pub(super) fn multiply_vectors_sse(mut a: __m128i, mut b: __m128i) -> __m128i {
+    let zero = _mm_setzero_si128();
+    let one = _mm_set1_epi8(1);
+    let reduction = _mm_set1_epi8(0x1b);
+    let low7 = _mm_set1_epi8(0x7f);
+    let mut product = zero;
+    for round in 0..8 {
+        let active = _mm_cmpeq_epi8(_mm_and_si128(b, one), one);
+        product = _mm_xor_si128(product, _mm_and_si128(a, active));
+        if round == 7 {
+            break;
+        }
+        let carry = _mm_cmpgt_epi8(zero, a);
+        a = _mm_xor_si128(_mm_add_epi8(a, a), _mm_and_si128(reduction, carry));
+        b = _mm_and_si128(_mm_srli_epi16::<1>(b), low7);
+    }
+    product
+}
+
+/// `dst[i] = a[i] * b[i]` by branchless shift/reduce over 32-byte lanes.
+pub fn elementwise_avx2(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    debug_assert_eq!(dst.len(), a.len());
+    debug_assert_eq!(dst.len(), b.len());
+    // SAFETY: the selected backend guarantees AVX2, and all three lengths
+    // match.
+    unsafe { elementwise_avx2_impl(dst, a, b) }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn elementwise_avx2_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    let len = dst.len().min(a.len()).min(b.len()) & !31;
+    let (dst_ptr, a_ptr, b_ptr) = (dst.as_mut_ptr(), a.as_ptr(), b.as_ptr());
+    let mut offset = 0;
+    while offset < len {
+        // SAFETY: `offset + 32 <= len`, which bounds all three slices.
+        unsafe {
+            let x = _mm256_loadu_si256(a_ptr.add(offset).cast());
+            let y = _mm256_loadu_si256(b_ptr.add(offset).cast());
+            _mm256_storeu_si256(dst_ptr.add(offset).cast(), multiply_vectors_avx2(x, y));
+        }
+        offset += 32;
+    }
+    // SAFETY: AVX2 implies SSSE3, and the remainders keep equal lengths.
+    unsafe { elementwise_ssse3_impl(&mut dst[len..], &a[len..], &b[len..]) }
+}
+
+/// `dst[i] = a[i] * b[i]` by branchless shift/reduce over 16-byte lanes.
+pub fn elementwise_ssse3(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    debug_assert_eq!(dst.len(), a.len());
+    debug_assert_eq!(dst.len(), b.len());
+    // SAFETY: the selected backend guarantees SSSE3, and all three lengths
+    // match.
+    unsafe { elementwise_ssse3_impl(dst, a, b) }
+}
+
+#[inline]
+#[target_feature(enable = "ssse3")]
+unsafe fn elementwise_ssse3_impl(dst: &mut [u8], a: &[u8], b: &[u8]) {
+    let len = dst.len().min(a.len()).min(b.len()) & !15;
+    let (dst_ptr, a_ptr, b_ptr) = (dst.as_mut_ptr(), a.as_ptr(), b.as_ptr());
+    let mut offset = 0;
+    while offset < len {
+        // SAFETY: `offset + 16 <= len`, which bounds all three slices.
+        unsafe {
+            let x = _mm_loadu_si128(a_ptr.add(offset).cast());
+            let y = _mm_loadu_si128(b_ptr.add(offset).cast());
+            _mm_storeu_si128(dst_ptr.add(offset).cast(), multiply_vectors_sse(x, y));
+        }
+        offset += 16;
+    }
+    for ((d, &x), &y) in dst[len..].iter_mut().zip(&a[len..]).zip(&b[len..]) {
+        *d = Elem(x).mul(Elem(y)).0;
+    }
+}
+
 /// Many sources into one destination, register-blocked over 128-byte tiles.
 pub fn gather_gfni(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     debug_assert_eq!(coeffs.len(), srcs.len());
@@ -1521,7 +1637,6 @@ unsafe fn scatter_ssse3_impl(rows: &mut [u8], row_len: usize, coeffs: &[Elem], s
 }
 
 /// Many sources into many rows using AVX2 nibble shuffles.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn matrix_avx2(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
     matrix_avx2_with(rows, row_len, nrows, terms);
 }
@@ -1537,7 +1652,6 @@ pub fn matrix_avx2_with<M: Matrix<Elem> + ?Sized>(
     unsafe { matrix_avx2_impl(rows, row_len, nrows, terms) }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "avx2")]
 unsafe fn matrix_avx2_impl<M: Matrix<Elem> + ?Sized>(
     rows: &mut [u8],
@@ -1549,50 +1663,21 @@ unsafe fn matrix_avx2_impl<M: Matrix<Elem> + ?Sized>(
         return;
     }
     let vector_len = row_len & !31;
+    let tile_len = row_len & !63;
     let base = rows.as_mut_ptr();
-    let mask = _mm256_set1_epi8(0x0f);
     let mut group = 0;
     while group < nrows {
         let count = (nrows - group).min(4);
-        let mut offset = 0;
-        while offset < vector_len {
-            let mut acc = [_mm256_setzero_si256(); 4];
-            // SAFETY: every selected row contains this 32-byte window.
-            unsafe {
-                for (slot, value) in acc.iter_mut().take(count).enumerate() {
-                    *value = _mm256_loadu_si256(base.add((group + slot) * row_len + offset).cast());
-                }
-            }
-            for term in 0..terms.len() {
-                let src = terms.source(term);
-                // SAFETY: every term source is exactly `row_len` bytes.
-                let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast()) };
-                for (slot, value) in acc.iter_mut().take(count).enumerate() {
-                    let table = scale_table(*terms.coefficient(term, group + slot));
-                    // SAFETY: each table half is exactly 16 bytes.
-                    unsafe {
-                        let lo =
-                            _mm256_broadcastsi128_si256(_mm_loadu_si128(table.lo.as_ptr().cast()));
-                        let hi =
-                            _mm256_broadcastsi128_si256(_mm_loadu_si128(table.hi.as_ptr().cast()));
-                        let product = _mm256_xor_si256(
-                            _mm256_shuffle_epi8(lo, _mm256_and_si256(x, mask)),
-                            _mm256_shuffle_epi8(
-                                hi,
-                                _mm256_and_si256(_mm256_srli_epi16::<4>(x), mask),
-                            ),
-                        );
-                        *value = _mm256_xor_si256(*value, product);
-                    }
-                }
-            }
-            // SAFETY: the same disjoint row windows loaded above.
-            unsafe {
-                for (slot, &value) in acc.iter().take(count).enumerate() {
-                    _mm256_storeu_si256(base.add((group + slot) * row_len + offset).cast(), value);
-                }
-            }
-            offset += 32;
+        // SAFETY: rows `group..group + count` start at `base + j * row_len`
+        // and span `row_len` bytes, which the wrapper checked lies inside
+        // `rows`; distinct rows are `row_len` apart, so the group is
+        // pairwise disjoint. `count` is at most four, and the wrapper checked
+        // every term for `nrows` coefficients over a `row_len`-byte source.
+        unsafe { matrix_tiles_avx2(base, row_len, group, count, tile_len, terms) }
+        // At most one 32-byte vector survives the 64-byte tile loop.
+        if tile_len < vector_len {
+            // SAFETY: as above, and `tile_len + 32 <= vector_len <= row_len`.
+            unsafe { matrix_vector_avx2(base, row_len, group, count, tile_len, terms) }
         }
         for slot in 0..count {
             // SAFETY: this is the selected row's disjoint tail, AVX2 implies
@@ -1613,8 +1698,159 @@ unsafe fn matrix_avx2_impl<M: Matrix<Elem> + ?Sized>(
     }
 }
 
+/// Fold every term into a group of up to four rows, 64 bytes of each row at
+/// a time.
+///
+/// Two accumulator vectors per row, matching the 64-byte tile of
+/// [`matrix_rows4`], so a coefficient's nibble tables are broadcast once per
+/// (tile, term) and shuffled twice. Lifting the broadcast clear of the tile
+/// loop the way [`scatter_avx2`] does is only possible there because a
+/// scatter has a single source, so four tables cover the whole row group; a
+/// matrix would need `4 * terms.len()` tables live at once, well past the
+/// register file. Deepening the tile is the reachable form of the same
+/// saving, and it cannot cost destination traffic: the tile still absorbs
+/// every term before it is stored.
+///
+/// A full four-row group is the one shape that does not fit the register
+/// file: eight accumulators, four nibble indices, a table pair and two
+/// shuffle temporaries need seventeen YMM registers, so the last row's two
+/// accumulators live on the stack. That still trades eight table broadcasts
+/// for two reloads and two stores per (tile, term), and the round trip sits
+/// off the critical path behind sixteen shuffles, so the tile is a net
+/// sixteen-to-twelve reduction in memory operations. Narrower groups stay
+/// entirely in registers.
+///
+/// # Safety
+/// Rows `group..group + count` must be in bounds from `base` at `row_len`
+/// bytes each, `count` must be at most four, `tile_len` must be
+/// `row_len & !63`, every term's source must be `row_len` bytes, and every
+/// term must supply coefficients through index `group + count - 1`.
+#[target_feature(enable = "avx2")]
+unsafe fn matrix_tiles_avx2<M: Matrix<Elem> + ?Sized>(
+    base: *mut u8,
+    row_len: usize,
+    group: usize,
+    count: usize,
+    tile_len: usize,
+    terms: &M,
+) {
+    let mask = _mm256_set1_epi8(0x0f);
+    let mut offset = 0;
+    while offset < tile_len {
+        let mut acc = [[_mm256_setzero_si256(); 2]; 4];
+        // SAFETY: every selected row contains this 64-byte window.
+        unsafe {
+            for (slot, value) in acc.iter_mut().take(count).enumerate() {
+                let ptr = base.add((group + slot) * row_len + offset);
+                value[0] = _mm256_loadu_si256(ptr.cast());
+                value[1] = _mm256_loadu_si256(ptr.add(32).cast());
+            }
+        }
+        for term in 0..terms.len() {
+            let src = terms.source(term);
+            // SAFETY: every term source is exactly `row_len` bytes.
+            let (x0, x1) = unsafe {
+                let sp = src.as_ptr().add(offset);
+                (
+                    _mm256_loadu_si256(sp.cast()),
+                    _mm256_loadu_si256(sp.add(32).cast()),
+                )
+            };
+            // Nibble indices depend on the source alone, so the whole row
+            // group shares them.
+            let indices = [
+                _mm256_and_si256(x0, mask),
+                _mm256_and_si256(_mm256_srli_epi16::<4>(x0), mask),
+                _mm256_and_si256(x1, mask),
+                _mm256_and_si256(_mm256_srli_epi16::<4>(x1), mask),
+            ];
+            for (slot, value) in acc.iter_mut().take(count).enumerate() {
+                let table = scale_table(*terms.coefficient(term, group + slot));
+                // SAFETY: each table half is exactly 16 bytes.
+                unsafe {
+                    let lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(table.lo.as_ptr().cast()));
+                    let hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(table.hi.as_ptr().cast()));
+                    value[0] = _mm256_xor_si256(
+                        value[0],
+                        _mm256_xor_si256(
+                            _mm256_shuffle_epi8(lo, indices[0]),
+                            _mm256_shuffle_epi8(hi, indices[1]),
+                        ),
+                    );
+                    value[1] = _mm256_xor_si256(
+                        value[1],
+                        _mm256_xor_si256(
+                            _mm256_shuffle_epi8(lo, indices[2]),
+                            _mm256_shuffle_epi8(hi, indices[3]),
+                        ),
+                    );
+                }
+            }
+        }
+        // SAFETY: the same disjoint row windows loaded above.
+        unsafe {
+            for (slot, value) in acc.iter().take(count).enumerate() {
+                let ptr = base.add((group + slot) * row_len + offset);
+                _mm256_storeu_si256(ptr.cast(), value[0]);
+                _mm256_storeu_si256(ptr.add(32).cast(), value[1]);
+            }
+        }
+        offset += 64;
+    }
+}
+
+/// Fold every term into one 32-byte window of a group of up to four rows.
+///
+/// # Safety
+/// As [`matrix_tiles_avx2`], with `offset + 32 <= row_len`.
+#[target_feature(enable = "avx2")]
+unsafe fn matrix_vector_avx2<M: Matrix<Elem> + ?Sized>(
+    base: *mut u8,
+    row_len: usize,
+    group: usize,
+    count: usize,
+    offset: usize,
+    terms: &M,
+) {
+    let mask = _mm256_set1_epi8(0x0f);
+    let mut acc = [_mm256_setzero_si256(); 4];
+    // SAFETY: every selected row contains this 32-byte window.
+    unsafe {
+        for (slot, value) in acc.iter_mut().take(count).enumerate() {
+            *value = _mm256_loadu_si256(base.add((group + slot) * row_len + offset).cast());
+        }
+    }
+    for term in 0..terms.len() {
+        let src = terms.source(term);
+        // SAFETY: every term source is exactly `row_len` bytes.
+        let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast()) };
+        let indices_lo = _mm256_and_si256(x, mask);
+        let indices_hi = _mm256_and_si256(_mm256_srli_epi16::<4>(x), mask);
+        for (slot, value) in acc.iter_mut().take(count).enumerate() {
+            let table = scale_table(*terms.coefficient(term, group + slot));
+            // SAFETY: each table half is exactly 16 bytes.
+            unsafe {
+                let lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(table.lo.as_ptr().cast()));
+                let hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(table.hi.as_ptr().cast()));
+                *value = _mm256_xor_si256(
+                    *value,
+                    _mm256_xor_si256(
+                        _mm256_shuffle_epi8(lo, indices_lo),
+                        _mm256_shuffle_epi8(hi, indices_hi),
+                    ),
+                );
+            }
+        }
+    }
+    // SAFETY: the same disjoint row windows loaded above.
+    unsafe {
+        for (slot, &value) in acc.iter().take(count).enumerate() {
+            _mm256_storeu_si256(base.add((group + slot) * row_len + offset).cast(), value);
+        }
+    }
+}
+
 /// Many sources into many rows using SSSE3 nibble shuffles.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn matrix_ssse3(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
     matrix_ssse3_with(rows, row_len, nrows, terms);
 }
@@ -1630,7 +1866,6 @@ pub fn matrix_ssse3_with<M: Matrix<Elem> + ?Sized>(
     unsafe { matrix_ssse3_impl(rows, row_len, nrows, terms) }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "ssse3")]
 unsafe fn matrix_ssse3_impl<M: Matrix<Elem> + ?Sized>(
     rows: &mut [u8],

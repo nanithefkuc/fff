@@ -8,11 +8,12 @@
 //! factors with a nibble shuffle.
 
 use crate::field::gf16::{Elem, Gf16};
-// `Backend`, `TowerCoeff` and `TowerTables` are referenced only from the SIMD
-// dispatch arms, which cfg away entirely on a scalar-only build or on an
-// architecture without the corresponding backend.
+use crate::kernel::tables::{ScaleTable, TowerCoeff, scale_table};
+// `Backend` and `TowerTables` are referenced only from the SIMD dispatch
+// arms, which cfg away entirely on a scalar-only build or on an architecture
+// without the corresponding backend.
 #[allow(unused_imports)]
-use crate::kernel::tables::{TowerCoeff, TowerTables};
+use crate::kernel::tables::TowerTables;
 #[allow(unused_imports)]
 use crate::kernel::{Backend, FieldKernels, backend, scalar};
 
@@ -32,7 +33,7 @@ use crate::kernel::x86;
 /// host builds them once instead of on every call.
 #[derive(Clone, Debug)]
 pub enum Prepared {
-    /// Native byte multiply (GFNI): a pair of broadcast words.
+    /// Native byte multiply (GFNI) or `PMULL`: a pair of broadcast words.
     Compact(TowerCoeff),
     /// Shuffle backends (AVX2, SSSE3, NEON): four nibble tables.
     Tables(TowerTables),
@@ -53,6 +54,25 @@ impl Prepared {
     }
 }
 
+/// The four base-field nibble tables for `coeff`, borrowed from the shared
+/// bank.
+///
+/// Deliberately not a [`TowerTables`]: that copies 136 bytes of table onto the
+/// stack, and the tail handlers below run on as little as a single two-byte
+/// element. Borrowing costs the two base multiplies of [`TowerCoeff::new`]
+/// plus four rodata indexes, so the blocked backend kernels resolve their
+/// coefficients through here too rather than duplicating the derivation.
+#[inline]
+pub(crate) fn factor_tables(coeff: Elem) -> [&'static ScaleTable; 4] {
+    let f = TowerCoeff::new(coeff).factors();
+    [
+        scale_table(f[0]),
+        scale_table(f[1]),
+        scale_table(f[2]),
+        scale_table(f[3]),
+    ]
+}
+
 /// `dst ^= coeff * src` over interleaved elements, one element at a time.
 ///
 /// The tail handler for the vector kernels.
@@ -66,12 +86,27 @@ pub(crate) fn mul_add_scalar(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     mul_add_scalar_impl(dst, coeff, src);
 }
 
+/// Per element this is 8 nibble lookups and 7 XORs against the 3 base-field
+/// multiplies a Karatsuba [`Elem::mul`] performs — each of those a
+/// carry-less product plus reduction, and none of them shared between
+/// elements. Since `coeff` is fixed for the whole buffer its four base
+/// factors collapse into split-nibble tables once, so the loop body becomes
+/// pure loads.
 fn mul_add_scalar_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
+    if coeff == Elem::ZERO {
+        return;
+    }
+    if coeff == Elem::ONE {
+        scalar::xor(dst, src);
+        return;
+    }
+    let [f0, f1, f2, f3] = factor_tables(coeff);
     for (d, s) in dst.chunks_exact_mut(2).zip(src.chunks_exact(2)) {
-        let product = Elem::from_bytes([s[0], s[1]]).mul(coeff);
-        let current = Elem::from_bytes([d[0], d[1]]);
-        d.copy_from_slice(&current.add(product).to_bytes());
+        let (a_lo, a_hi) = ((s[0] & 0x0f) as usize, (s[0] >> 4) as usize);
+        let (b_lo, b_hi) = ((s[1] & 0x0f) as usize, (s[1] >> 4) as usize);
+        d[0] ^= f0.lo[a_lo] ^ f0.hi[a_hi] ^ f2.lo[b_lo] ^ f2.hi[b_hi];
+        d[1] ^= f1.lo[b_lo] ^ f1.hi[b_hi] ^ f3.lo[a_lo] ^ f3.hi[a_hi];
     }
 }
 
@@ -86,10 +121,22 @@ pub(crate) fn mul_assign_scalar(dst: &mut [u8], coeff: Elem) {
     mul_assign_scalar_impl(dst, coeff);
 }
 
+/// Table-driven for the same reason as [`mul_add_scalar_impl`], reading the
+/// destination as its own source.
 fn mul_assign_scalar_impl(dst: &mut [u8], coeff: Elem) {
+    if coeff == Elem::ONE {
+        return;
+    }
+    if coeff == Elem::ZERO {
+        dst.fill(0);
+        return;
+    }
+    let [f0, f1, f2, f3] = factor_tables(coeff);
     for d in dst.chunks_exact_mut(2) {
-        let value = Elem::from_bytes([d[0], d[1]]).mul(coeff);
-        d.copy_from_slice(&value.to_bytes());
+        let (a_lo, a_hi) = ((d[0] & 0x0f) as usize, (d[0] >> 4) as usize);
+        let (b_lo, b_hi) = ((d[1] & 0x0f) as usize, (d[1] >> 4) as usize);
+        d[0] = f0.lo[a_lo] ^ f0.hi[a_hi] ^ f2.lo[b_lo] ^ f2.hi[b_hi];
+        d[1] = f1.lo[b_lo] ^ f1.hi[b_hi] ^ f3.lo[a_lo] ^ f3.hi[a_hi];
     }
 }
 
@@ -108,30 +155,36 @@ pub(crate) fn mul_into_scalar(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     mul_into_scalar_impl(dst, coeff, src);
 }
 
+/// Table-driven for the same reason as [`mul_add_scalar_impl`], storing the
+/// product instead of accumulating it.
 fn mul_into_scalar_impl(dst: &mut [u8], coeff: Elem, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
+    if coeff == Elem::ZERO {
+        dst.fill(0);
+        return;
+    }
+    if coeff == Elem::ONE {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let [f0, f1, f2, f3] = factor_tables(coeff);
     for (d, s) in dst.chunks_exact_mut(2).zip(src.chunks_exact(2)) {
-        let product = Elem::from_bytes([s[0], s[1]]).mul(coeff);
-        d.copy_from_slice(&product.to_bytes());
+        let (a_lo, a_hi) = ((s[0] & 0x0f) as usize, (s[0] >> 4) as usize);
+        let (b_lo, b_hi) = ((s[1] & 0x0f) as usize, (s[1] >> 4) as usize);
+        d[0] = f0.lo[a_lo] ^ f0.hi[a_hi] ^ f2.lo[b_lo] ^ f2.hi[b_hi];
+        d[1] = f1.lo[b_lo] ^ f1.hi[b_hi] ^ f3.lo[a_lo] ^ f3.hi[a_hi];
     }
 }
 
-/// GFNI's compact factors are cheap to derive, but the generic blocked gather
-/// cannot keep a variable number of broadcasts live and measured 1.5–2.7x
-/// behind the four-chain single-coefficient kernel. Repeated GFNI AXPY is the
-/// measured crossover for this one shape.
-#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-fn gather_gfni_axpy(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
-    for (&coeff, &src) in coeffs.iter().zip(srcs) {
-        x86::gf16::mul_add_gfni(dst, TowerCoeff::new(coeff), src);
-    }
-}
-
+/// Repeated AXPY, used where blocking a GF(2^16) gather does not pay.
+///
 /// AVX2 has enough width but not enough registers to retain several
-/// GF(2^16) four-table coefficient sets: the blocked gather/matrix kernels
-/// spill and measured 3–25% behind repeated AVX2 AXPY. SSSE3's smaller table
-/// vectors, by contrast, win 1.4–1.5x. Use the measured crossover rather than
-/// forcing the nominally wider blocked kernel.
+/// four-table coefficient sets, and a gather has nothing to share in any
+/// case: coefficients are one-to-one with sources, so a source's nibble split
+/// feeds exactly one coefficient. It measured at parity or behind repeated
+/// AXPY, so AXPY stays wired. SSSE3's smaller table vectors do block
+/// profitably and are wired to the blocked kernel. See "Crossover and
+/// dispatch decisions" in BENCHMARKS.md.
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
 fn gather_avx2_axpy(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     for (&coeff, &src) in coeffs.iter().zip(srcs) {
@@ -139,6 +192,14 @@ fn gather_avx2_axpy(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
     }
 }
 
+/// Repeated AXPY, used where blocking a GF(2^16) matrix does not pay.
+///
+/// The blocked AVX2 matrix folds every term into a register-resident
+/// destination tile, which should beat re-reading the destination per term.
+/// It does not, quite: it wins on short rows and sits at parity or slightly
+/// behind on long ones, which is not enough to justify a row-length branch in
+/// dispatch (BENCHMARKS.md). Revisit if the tile ever widens past two
+/// accumulators.
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
 fn matrix_avx2_axpy(rows: &mut [u8], row_len: usize, terms: &[(&[Elem], &[u8])]) {
     for &(coeffs, src) in terms {
@@ -154,7 +215,11 @@ impl FieldKernels for Gf16 {
     fn prepare(coeff: Elem) -> Prepared {
         match backend() {
             Backend::Avx512 | Backend::Gfni => Prepared::Compact(TowerCoeff::new(coeff)),
-            Backend::Avx2 | Backend::Ssse3 | Backend::Neon | Backend::Simd128 => {
+            // PMULL is table-free, so the broadcast-word form looks like the
+            // natural fit here. It is not: it measured far behind these four
+            // nibble tables (see `aarch64::gf16`), so PMULL hosts prepare and
+            // shuffle exactly like baseline NEON.
+            Backend::Avx2 | Backend::Ssse3 | Backend::Pmull | Backend::Neon | Backend::Simd128 => {
                 Prepared::Tables(TowerTables::new(coeff))
             }
             Backend::Scalar => Prepared::Plain(coeff),
@@ -174,7 +239,13 @@ impl FieldKernels for Gf16 {
     fn has_vector_elementwise() -> bool {
         matches!(
             backend(),
-            Backend::Avx512 | Backend::Gfni | Backend::Neon | Backend::Simd128
+            Backend::Avx512
+                | Backend::Gfni
+                | Backend::Avx2
+                | Backend::Ssse3
+                | Backend::Pmull
+                | Backend::Neon
+                | Backend::Simd128
         )
     }
 
@@ -230,8 +301,12 @@ impl FieldKernels for Gf16 {
                 Backend::Ssse3 => x86::gf16::mul_into_ssse3(dst, tables, src),
                 _ => x86::gf16::mul_into_avx2(dst, tables, src),
             },
-            // aarch64 and wasm32 keep the default copy-then-scale until their
-            // GF(2^16) fused kernels are written.
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            Prepared::Tables(tables) => aarch64::gf16::mul_into_neon(dst, tables, src),
+            #[cfg(all(feature = "simd", target_arch = "wasm32"))]
+            Prepared::Tables(tables) => wasm32::gf16::mul_into_simd128(dst, tables, src),
+            // Every other prepared form is a scalar coefficient: copying and
+            // scaling in place is one pass either way.
             other => {
                 dst.copy_from_slice(src);
                 Self::mul_assign(dst, other);
@@ -249,11 +324,23 @@ impl FieldKernels for Gf16 {
             Backend::Avx2 => x86::gf16::scatter_avx2(rows, row_len, coeffs, src),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Ssse3 => x86::gf16::scatter_ssse3(rows, row_len, coeffs, src),
+            // Multi-row shapes keep the nibble tables: they derive them once
+            // per coefficient and then amortize the cheaper byte loop over
+            // every row of the group, which is the trade PMULL loses.
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon => aarch64::gf16::scatter_neon(rows, row_len, coeffs, src),
+            Backend::Neon | Backend::Pmull => {
+                aarch64::gf16::scatter_neon(rows, row_len, coeffs, src);
+            }
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => wasm32::gf16::scatter_simd128(rows, row_len, coeffs, src),
-            _ => scalar::mul_add_scatter::<Gf16>(rows, row_len, coeffs, src),
+            // Not `scalar::mul_add_scatter`: that would re-derive a full
+            // Karatsuba multiply per element. `mul_add_scalar` amortizes one
+            // table resolve over each row.
+            _ => {
+                for (row, &coeff) in rows.chunks_exact_mut(row_len).zip(coeffs) {
+                    mul_add_scalar(row, coeff, src);
+                }
+            }
         }
     }
     fn mul_add_scatter_plan(
@@ -279,17 +366,29 @@ impl FieldKernels for Gf16 {
         match backend() {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Avx512 => x86::avx512::gf16_gather(dst, coeffs, srcs),
+            // Blocked: the four-source group derives its broadcasts once and
+            // keeps them live, so it reads the destination once per group
+            // instead of once per source. That hoist is what makes it beat
+            // repeated GFNI AXPY; with the broadcasts still inside the byte
+            // loop the same kernel lost badly, which is why dispatch used to
+            // avoid it. Numbers in BENCHMARKS.md.
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Gfni => gather_gfni_axpy(dst, coeffs, srcs),
+            Backend::Gfni => x86::gf16::gather_gfni(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Avx2 => gather_avx2_axpy(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Ssse3 => x86::gf16::gather_ssse3(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon => aarch64::gf16::gather_neon(dst, coeffs, srcs),
+            Backend::Neon | Backend::Pmull => aarch64::gf16::gather_neon(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => wasm32::gf16::gather_simd128(dst, coeffs, srcs),
-            _ => scalar::mul_add_gather::<Gf16>(dst, coeffs, srcs),
+            // See `mul_add_scatter`: one table resolve per term beats the
+            // generic oracle's per-element multiply.
+            _ => {
+                for (&coeff, &src) in coeffs.iter().zip(srcs) {
+                    mul_add_scalar(dst, coeff, src);
+                }
+            }
         }
     }
 
@@ -313,10 +412,21 @@ impl FieldKernels for Gf16 {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Ssse3 => x86::gf16::matrix_ssse3(rows, row_len, nrows, terms),
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon => aarch64::gf16::matrix_neon(rows, row_len, nrows, terms),
+            Backend::Neon | Backend::Pmull => {
+                aarch64::gf16::matrix_neon(rows, row_len, nrows, terms);
+            }
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => wasm32::gf16::matrix_simd128(rows, row_len, nrows, terms),
-            _ => scalar::mul_add_matrix::<Gf16>(rows, row_len, nrows, terms),
+            // See `mul_add_scatter`: one table resolve per (term, row) beats
+            // the generic oracle's per-element multiply.
+            _ => {
+                for &(coeffs, src) in terms {
+                    let blocks = rows.chunks_exact_mut(row_len).take(nrows);
+                    for (row, &coeff) in blocks.zip(coeffs) {
+                        mul_add_scalar(row, coeff, src);
+                    }
+                }
+            }
         }
     }
     fn mul_add_matrix_plan(
@@ -369,16 +479,23 @@ impl FieldKernels for Gf16 {
             Backend::Avx512 => x86::avx512::gf16_elementwise(dst, a, b),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
             Backend::Gfni => x86::gf16::elementwise_gfni(dst, a, b),
+            // Unlike GF(2^8), the tower elementwise product does *not* prefer
+            // PMULL: the same three-multiply identity over `vmull_p8`
+            // measured behind these bit-serial rounds, so that kernel was
+            // removed rather than wired. GF(2^8) elementwise, where PMULL
+            // replaces eight bit-serial rounds with two multiplies, does win
+            // — see `Gf8::mul_elementwise` and BENCHMARKS.md.
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon if std::arch::is_aarch64_feature_detected!("aes") => {
-                aarch64::gf16::elementwise_pmull(dst, a, b);
-            }
-            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon => aarch64::gf16::elementwise_neon(dst, a, b),
+            Backend::Neon | Backend::Pmull => aarch64::gf16::elementwise_neon(dst, a, b),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
             Backend::Simd128 => wasm32::gf16::elementwise_simd128(dst, a, b),
-            // See `Gf8::mul_elementwise`: with both operands varying there is
-            // no fixed coefficient for a nibble table to be built from.
+            // See `Gf8::mul_elementwise`: no fixed coefficient, so the
+            // shuffle backends multiply the two varying base-field operands
+            // bit-serially and keep a nibble table only for constant `DELTA`.
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Avx2 => x86::gf16::elementwise_avx2(dst, a, b),
+            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+            Backend::Ssse3 => x86::gf16::elementwise_ssse3(dst, a, b),
             _ => scalar::mul_elementwise::<Gf16>(dst, a, b),
         }
     }

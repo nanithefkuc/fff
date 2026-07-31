@@ -106,21 +106,26 @@ fn main() {
 
     // reed-solomon-erasure (simd-accel: SSSE3/AVX2). GF(2^8), poly 0x11D.
     // mul_slice_xor(c, input, out) == dst ^= c * src, the exact mul_add analog.
-    println!("reed-solomon-erasure 6 (simd-accel)");
-    let mut rse_dst = noise(BYTES, 0x701);
-    let rse_src = noise(BYTES, 0x702);
-    bench_region("w8 mul_slice_xor (dst ^= c*src)", BYTES, || {
-        reed_solomon_erasure::galois_8::mul_slice_xor(
-            0x53,
-            black_box(&rse_src),
-            black_box(&mut rse_dst),
-        );
-    });
-    bench_region("w8 mul_slice (dst = c*src)", BYTES, || {
-        reed_solomon_erasure::galois_8::mul_slice(
-            0x53,
-            black_box(&rse_src),
-            black_box(&mut rse_dst),
-        );
-    });
+    // The C `simd-accel` path has no wasm sysroot, so the dependency — and
+    // this section — exist on native targets only.
+    #[cfg(not(target_family = "wasm"))]
+    {
+        println!("reed-solomon-erasure 6 (simd-accel)");
+        let mut rse_dst = noise(BYTES, 0x701);
+        let rse_src = noise(BYTES, 0x702);
+        bench_region("w8 mul_slice_xor (dst ^= c*src)", BYTES, || {
+            reed_solomon_erasure::galois_8::mul_slice_xor(
+                0x53,
+                black_box(&rse_src),
+                black_box(&mut rse_dst),
+            );
+        });
+        bench_region("w8 mul_slice (dst = c*src)", BYTES, || {
+            reed_solomon_erasure::galois_8::mul_slice(
+                0x53,
+                black_box(&rse_src),
+                black_box(&mut rse_dst),
+            );
+        });
+    }
 }
