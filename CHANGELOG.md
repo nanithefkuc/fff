@@ -6,6 +6,33 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Backend migration onto `simdispatch` (umbrella P2).** `Backend` is now a
+  re-export of `simdispatch::Backend`; detection, ordering, the `BACKEND`
+  static, and the downgrade-only override are owned by `simdispatch` (Level 0,
+  via `archmage` `summon()`). This crate's `detect()`, `resolve_backend()`,
+  `BACKEND`, `Backend::ALL`, `is_for_current_arch`, local
+  `Display`/`FromStr`/`ParseBackendError`, and the `FFF_BACKEND` override are
+  deleted. Selection resolves `simdispatch::Selection` over `FFF_TIERS` once
+  per process and is cached. The field-kernel policy methods `has_native_mul`
+  and `has_blocked_rows` stay in this crate as the new `KernelBackend`
+  extension trait (they are policy, not hardware facts).
+- Tiers renamed to the `archmage` ladder: `Gfni` → `V3GfniCrypto` (`v3_gfni_crypto`),
+  `Avx2` → `V3` (`v3`), `Ssse3` → `V2` (`v2`), `Pmull` → `NeonAes` (`neon_aes`),
+  `Simd128` → `Wasm128` (`wasm128`). The 64-byte AVX-512 tier (`Avx512`) is
+  deferred (V4x): its kernels remain under the `internals` feature,
+  cross-compile-only, and are not in the ladder until validated on executing
+  hardware; AVX-512 hosts resolve to the 32-byte GFNI tier.
+- The `SIMD_BACKEND` environment variable replaces `FFF_BACKEND`, applied by
+  `simdispatch`. Results are unchanged on hosts without AVX-512 (same kernels
+  selected); a `simdispatch` git dependency (pinned to `v0.0.0`) is added —
+  re-pin consuming crates in the same sitting.
+- Tests: the cfg-based `is_for_current_arch` assertions are deleted; the
+  per-backend differential-test gates now resolve `simdispatch` selection
+  (`host_supports`) instead of `std::is_*_feature_detected!`. The AVX-512
+  kernel differential test is gated behind `internals` (no tier to resolve).
+
 ## [0.2.0] - 2026-07-31
 
 This release adds vector kernels for the fields that had none, widens the

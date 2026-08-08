@@ -85,13 +85,19 @@
 //!
 //! ## Features
 //!
-//! - `std` (default) — required for runtime CPU detection.
+//! - `std` (default) — the standards library (and its lazily-built table
+//!   banks).
 //! - `simd` (default, implies `std`) — the vector backends. Disabling leaves
 //!   the portable scalar kernels, which are correct but slow.
 //!
-//! [`backend()`] reports process-wide SIMD selection; [`backend_for`] reports
-//! the backend used by a specific field, so portable-only wider fields do not
-//! appear accelerated on a SIMD host.
+//! [`kernel::backend()`] reports the process-wide SIMD selection over the
+//! tiers this crate implements; [`backend_for`] reports the backend used by a
+//! specific field, so portable-only wider fields do not appear accelerated on
+//! a SIMD host. Detection and ordering are single-source: [`Backend`] is a
+//! re-export of [`simdispatch::Backend`](https://docs.rs/simdispatch), and
+//! selection is [`simdispatch`](https://github.com/nanithefkuc/simdispatch)'s
+//! `Selection` resolved over [`kernel::FFF_TIERS`], with the downgrade-only
+//! `SIMD_BACKEND` override.
 //!
 //! ## Safety and scope
 //!
@@ -124,5 +130,6 @@ pub use field::{
     gf32, gf64,
 };
 pub use kernel::{
-    Backend, FieldKernels, ParseBackendError, backend, backend_for, has_vector_elementwise,
+    Backend, FieldKernels, KernelBackend, ParseBackendError, backend, backend_for,
+    has_vector_elementwise,
 };

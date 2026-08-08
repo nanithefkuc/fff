@@ -105,32 +105,29 @@ impl FieldKernels for Gf8 {
     fn has_vector_elementwise() -> bool {
         matches!(
             backend(),
-            Backend::Avx512
-                | Backend::Gfni
-                | Backend::Avx2
-                | Backend::Ssse3
-                | Backend::Pmull
+            Backend::V3GfniCrypto
+                | Backend::V3
+                | Backend::V2
+                | Backend::NeonAes
                 | Backend::Neon
-                | Backend::Simd128
+                | Backend::Wasm128
         )
     }
 
     fn mul_add(dst: &mut [u8], coeff: &Self::Prepared, src: &[u8]) {
         match backend() {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx512 => x86::avx512::gf8_mul_add(dst, coeff.coeff, src),
+            Backend::V3GfniCrypto => x86::gf8::mul_add_gfni(dst, coeff.coeff, src),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Gfni => x86::gf8::mul_add_gfni(dst, coeff.coeff, src),
+            Backend::V3 => x86::gf8::mul_add_avx2(dst, coeff, src),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx2 => x86::gf8::mul_add_avx2(dst, coeff, src),
-            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Ssse3 => x86::gf8::mul_add_ssse3(dst, coeff, src),
+            Backend::V2 => x86::gf8::mul_add_ssse3(dst, coeff, src),
             // PMULL is table-free but far slower than the nibble shuffle for
             // a fixed coefficient; see `aarch64::gf8` and BENCHMARKS.md.
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon | Backend::Pmull => aarch64::gf8::mul_add_neon(dst, coeff, src),
+            Backend::Neon | Backend::NeonAes => aarch64::gf8::mul_add_neon(dst, coeff, src),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
-            Backend::Simd128 => wasm32::gf8::mul_add_simd128(dst, coeff, src),
+            Backend::Wasm128 => wasm32::gf8::mul_add_simd128(dst, coeff, src),
             _ => mul_add_nibble(dst, coeff, src),
         }
     }
@@ -138,17 +135,15 @@ impl FieldKernels for Gf8 {
     fn mul_assign(dst: &mut [u8], coeff: &Self::Prepared) {
         match backend() {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx512 => x86::avx512::gf8_mul_assign(dst, coeff.coeff),
+            Backend::V3GfniCrypto => x86::gf8::mul_assign_gfni(dst, coeff.coeff),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Gfni => x86::gf8::mul_assign_gfni(dst, coeff.coeff),
+            Backend::V3 => x86::gf8::mul_assign_avx2(dst, coeff),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx2 => x86::gf8::mul_assign_avx2(dst, coeff),
-            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Ssse3 => x86::gf8::mul_assign_ssse3(dst, coeff),
+            Backend::V2 => x86::gf8::mul_assign_ssse3(dst, coeff),
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon | Backend::Pmull => aarch64::gf8::mul_assign_neon(dst, coeff),
+            Backend::Neon | Backend::NeonAes => aarch64::gf8::mul_assign_neon(dst, coeff),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
-            Backend::Simd128 => wasm32::gf8::mul_assign_simd128(dst, coeff),
+            Backend::Wasm128 => wasm32::gf8::mul_assign_simd128(dst, coeff),
             _ => mul_assign_nibble(dst, coeff),
         }
     }
@@ -156,17 +151,15 @@ impl FieldKernels for Gf8 {
     fn mul_into(dst: &mut [u8], coeff: &Self::Prepared, src: &[u8]) {
         match backend() {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx512 => x86::avx512::gf8_mul_into(dst, coeff.coeff, src),
+            Backend::V3GfniCrypto => x86::gf8::mul_into_gfni(dst, coeff.coeff, src),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Gfni => x86::gf8::mul_into_gfni(dst, coeff.coeff, src),
+            Backend::V3 => x86::gf8::mul_into_avx2(dst, coeff, src),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx2 => x86::gf8::mul_into_avx2(dst, coeff, src),
-            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Ssse3 => x86::gf8::mul_into_ssse3(dst, coeff, src),
+            Backend::V2 => x86::gf8::mul_into_ssse3(dst, coeff, src),
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon | Backend::Pmull => aarch64::gf8::mul_into_neon(dst, coeff, src),
+            Backend::Neon | Backend::NeonAes => aarch64::gf8::mul_into_neon(dst, coeff, src),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
-            Backend::Simd128 => wasm32::gf8::mul_into_simd128(dst, coeff, src),
+            Backend::Wasm128 => wasm32::gf8::mul_into_simd128(dst, coeff, src),
             _ => mul_into_nibble(dst, coeff, src),
         }
     }
@@ -174,19 +167,17 @@ impl FieldKernels for Gf8 {
     fn mul_add_scatter(rows: &mut [u8], row_len: usize, coeffs: &[Elem], src: &[u8]) {
         match backend() {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx512 => x86::avx512::gf8_scatter(rows, row_len, coeffs, src),
+            Backend::V3GfniCrypto => x86::gf8::scatter_gfni(rows, row_len, coeffs, src),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Gfni => x86::gf8::scatter_gfni(rows, row_len, coeffs, src),
+            Backend::V3 => x86::gf8::scatter_avx2(rows, row_len, coeffs, src),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx2 => x86::gf8::scatter_avx2(rows, row_len, coeffs, src),
-            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Ssse3 => x86::gf8::scatter_ssse3(rows, row_len, coeffs, src),
+            Backend::V2 => x86::gf8::scatter_ssse3(rows, row_len, coeffs, src),
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon | Backend::Pmull => {
+            Backend::Neon | Backend::NeonAes => {
                 aarch64::gf8::scatter_neon(rows, row_len, coeffs, src);
             }
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
-            Backend::Simd128 => wasm32::gf8::scatter_simd128(rows, row_len, coeffs, src),
+            Backend::Wasm128 => wasm32::gf8::scatter_simd128(rows, row_len, coeffs, src),
             _ => scalar::mul_add_scatter::<Self>(rows, row_len, coeffs, src),
         }
     }
@@ -203,17 +194,15 @@ impl FieldKernels for Gf8 {
     fn mul_add_gather(dst: &mut [u8], coeffs: &[Elem], srcs: &[&[u8]]) {
         match backend() {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx512 => x86::avx512::gf8_gather(dst, coeffs, srcs),
+            Backend::V3GfniCrypto => x86::gf8::gather_gfni(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Gfni => x86::gf8::gather_gfni(dst, coeffs, srcs),
+            Backend::V3 => x86::gf8::gather_avx2(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx2 => x86::gf8::gather_avx2(dst, coeffs, srcs),
-            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Ssse3 => x86::gf8::gather_ssse3(dst, coeffs, srcs),
+            Backend::V2 => x86::gf8::gather_ssse3(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon | Backend::Pmull => aarch64::gf8::gather_neon(dst, coeffs, srcs),
+            Backend::Neon | Backend::NeonAes => aarch64::gf8::gather_neon(dst, coeffs, srcs),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
-            Backend::Simd128 => wasm32::gf8::gather_simd128(dst, coeffs, srcs),
+            Backend::Wasm128 => wasm32::gf8::gather_simd128(dst, coeffs, srcs),
             _ => scalar::mul_add_gather::<Self>(dst, coeffs, srcs),
         }
     }
@@ -229,19 +218,17 @@ impl FieldKernels for Gf8 {
     fn mul_add_matrix(rows: &mut [u8], row_len: usize, nrows: usize, terms: &[(&[Elem], &[u8])]) {
         match backend() {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx512 => x86::avx512::gf8_matrix(rows, row_len, nrows, terms),
+            Backend::V3GfniCrypto => x86::gf8::matrix_gfni(rows, row_len, nrows, terms),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Gfni => x86::gf8::matrix_gfni(rows, row_len, nrows, terms),
+            Backend::V3 => x86::gf8::matrix_avx2(rows, row_len, nrows, terms),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx2 => x86::gf8::matrix_avx2(rows, row_len, nrows, terms),
-            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Ssse3 => x86::gf8::matrix_ssse3(rows, row_len, nrows, terms),
+            Backend::V2 => x86::gf8::matrix_ssse3(rows, row_len, nrows, terms),
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Neon | Backend::Pmull => {
+            Backend::Neon | Backend::NeonAes => {
                 aarch64::gf8::matrix_neon(rows, row_len, nrows, terms);
             }
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
-            Backend::Simd128 => wasm32::gf8::matrix_simd128(rows, row_len, nrows, terms),
+            Backend::Wasm128 => wasm32::gf8::matrix_simd128(rows, row_len, nrows, terms),
             _ => scalar::mul_add_matrix::<Self>(rows, row_len, nrows, terms),
         }
     }
@@ -263,13 +250,13 @@ impl FieldKernels for Gf8 {
                 sources: srcs,
             };
             match backend() {
-                Backend::Gfni => {
+                Backend::V3GfniCrypto => {
                     return x86::gf8::matrix_gfni_with(rows, row_len, nrows, &terms);
                 }
-                Backend::Avx2 => {
+                Backend::V3 => {
                     return x86::gf8::matrix_avx2_with(rows, row_len, nrows, &terms);
                 }
-                Backend::Ssse3 => {
+                Backend::V2 => {
                     return x86::gf8::matrix_ssse3_with(rows, row_len, nrows, &terms);
                 }
                 _ => {}
@@ -290,28 +277,27 @@ impl FieldKernels for Gf8 {
     fn mul_elementwise(dst: &mut [u8], a: &[u8], b: &[u8]) {
         match backend() {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx512 => x86::avx512::gf8_elementwise(dst, a, b),
             // `GF2P8MULB` multiplies two vectors directly: no broadcast, no
             // table, the same one instruction per 32 lanes.
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Gfni => x86::gf8::elementwise_gfni(dst, a, b),
+            Backend::V3GfniCrypto => x86::gf8::elementwise_gfni(dst, a, b),
             // Two varying operands are the one shape PMULL wins: two
             // `vmull_p8`s and a reduction network against eight bit-serial
             // rounds. The capability is cached in the backend, not probed per
             // call.
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-            Backend::Pmull => aarch64::gf8::elementwise_pmull(dst, a, b),
+            Backend::NeonAes => aarch64::gf8::elementwise_pmull(dst, a, b),
             #[cfg(all(feature = "simd", target_arch = "aarch64"))]
             Backend::Neon => aarch64::gf8::elementwise_neon(dst, a, b),
             #[cfg(all(feature = "simd", target_arch = "wasm32"))]
-            Backend::Simd128 => wasm32::gf8::elementwise_simd128(dst, a, b),
+            Backend::Wasm128 => wasm32::gf8::elementwise_simd128(dst, a, b),
             // No fixed coefficient means no nibble table, so the shuffle
             // backends use the same eight branchless shift/reduce rounds as
             // baseline NEON and wasm.
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx2 => x86::gf8::elementwise_avx2(dst, a, b),
+            Backend::V3 => x86::gf8::elementwise_avx2(dst, a, b),
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Ssse3 => x86::gf8::elementwise_ssse3(dst, a, b),
+            Backend::V2 => x86::gf8::elementwise_ssse3(dst, a, b),
             _ => scalar::mul_elementwise::<Gf8>(dst, a, b),
         }
     }

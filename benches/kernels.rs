@@ -7,8 +7,8 @@
 //!
 //! ```sh
 //! cargo bench --bench kernels
-//! FFF_BACKEND=avx2   cargo bench --bench kernels   # compare backends
-//! FFF_BACKEND=scalar cargo bench --bench kernels
+//! SIMD_BACKEND=v3      cargo bench --bench kernels   # compare backends
+//! SIMD_BACKEND=scalar cargo bench --bench kernels
 //! ```
 
 use std::hint::black_box;
@@ -456,7 +456,7 @@ fn bench_small_row_shapes() {
 
 fn main() {
     println!("fff kernel benchmark — backend: {}", backend().name());
-    println!("  (override with FFF_BACKEND=avx512|gfni|avx2|ssse3|pmull|neon|scalar)\n");
+    println!("  (override with SIMD_BACKEND=v3_gfni_crypto|v3|v2|neon|scalar)\n");
 
     bench_preparation_crossover();
     bench_small_row_shapes();

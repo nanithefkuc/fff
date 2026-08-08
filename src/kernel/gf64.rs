@@ -51,7 +51,7 @@ impl FieldKernels for Gf64 {
     fn prepare(coeff: Elem) -> Prepared {
         match backend() {
             #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            Backend::Avx512 | Backend::Gfni => Prepared::Compact {
+            Backend::V3GfniCrypto => Prepared::Compact {
                 coeff,
                 tiles: x86::gf64::gf64_tiles(coeff),
             },
@@ -67,7 +67,7 @@ impl FieldKernels for Gf64 {
     #[inline]
     fn active_backend() -> Backend {
         match backend() {
-            Backend::Avx512 | Backend::Gfni => backend(),
+            Backend::V3GfniCrypto => backend(),
             _ => Backend::Scalar,
         }
     }

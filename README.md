@@ -132,18 +132,22 @@ boundary of `mul_elementwise`.
 
 | Identifier | Target and requirements | Lane width |
 | --- | --- | --- |
-| `avx512` | x86 AVX-512F + AVX-512BW + GFNI | 64 bytes |
-| `gfni` | x86 AVX2 + GFNI | 32 bytes |
-| `avx2` | x86 AVX2 shuffle | 32 bytes |
-| `ssse3` | x86 SSSE3 shuffle | 16 bytes |
-| `pmull` | AArch64 NEON + PMULL; adds a vector `mul_elementwise` for GF(2^8) | 16 bytes |
+| `v3_gfni_crypto` | x86 AVX2 + GFNI + crypto | 32 bytes |
+| `v3` | x86 AVX2 shuffle | 32 bytes |
+| `v2` | x86 SSSE3/SSE4.2 shuffle | 16 bytes |
+| `neon_aes` | AArch64 NEON + AES (the AES feature proves PMULL) | 16 bytes |
 | `neon` | AArch64 NEON split-nibble shuffle | 16 bytes |
-| `simd128` | WebAssembly `simd128` | 16 bytes |
+| `wasm128` | WebAssembly `simd128` | 16 bytes |
 | `scalar` | portable fallback | scalar |
 
-`FFF_BACKEND=avx512|gfni|avx2|ssse3|pmull|neon|simd128|scalar` requests a backend at
-process startup. It is downgrade-only: an unsupported upgrade is ignored.
-`Backend::ALL`, `Display`, and `FromStr` support diagnostics and CLI wiring.
+The 64-byte AVX-512 GFNI tier is deferred: fff's `avx512.rs` kernels are
+cross-compile-only and are not in the shared ladder until validated on
+executing hardware (V4x, gated on fgf 1.0.0).
+
+`SIMD_BACKEND=v3_gfni_crypto|v3|v2|neon_aes|neon|wasm128|scalar` requests a
+backend at process startup. It is downgrade-only: an unsupported upgrade is
+ignored. Backends are a re-export of `simdispatch::Backend`; `name`,
+`from_name`, `Display`, and `FromStr` support diagnostics and CLI wiring.
 
 ## Features and platforms
 

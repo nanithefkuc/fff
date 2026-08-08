@@ -1,7 +1,7 @@
 //! Vector kernel semantics, against an independent elementwise oracle.
 //!
 //! These run on whatever backend the host selected, so on a GFNI machine they
-//! exercise GFNI. `FFF_BACKEND=scalar cargo test` reruns the same assertions
+//! exercise GFNI. `SIMD_BACKEND=scalar cargo test` reruns the same assertions
 //! against the portable path; the per-backend differential sweep that covers
 //! every backend in one process lives in the crate's unit tests.
 

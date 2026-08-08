@@ -34,7 +34,9 @@ Preserve these invariants:
 - Encodings are stable, fixed-width, little-endian, and alignment-free.
 - Addition and subtraction are XOR. By convention `inv(0) == 0` and
   `x / 0 == 0`; do not turn these total operations into errors.
-- Backend selection is cached once and `FFF_BACKEND` is downgrade-only.
+- Backend selection is cached once and `SIMD_BACKEND` (owned by `simdispatch`)
+  is downgrade-only. Detection and ordering are single-source: `Backend` is a
+  re-export of `simdispatch::Backend`.
 - Coefficients `0` and `1` are handled before expensive preparation.
 - Unsafe code stays inside architecture modules. Root code denies unsafe.
 - Raw multi-row kernels may be register-blocked, but not every
@@ -74,9 +76,9 @@ cargo test --lib kernel::tests -- --nocapture
 cargo test --doc
 
 # Required backend processes on capable x86 hardware
-FFF_BACKEND=avx2 cargo test --all-features
-FFF_BACKEND=ssse3 cargo test --all-features
-FFF_BACKEND=scalar cargo test --all-features
+SIMD_BACKEND=v3     cargo test --all-features
+SIMD_BACKEND=v2     cargo test --all-features
+SIMD_BACKEND=scalar cargo test --all-features
 
 # Formatting, linting, and docs
 cargo fmt --all -- --check
@@ -155,9 +157,9 @@ and host-specific compiler flags.
 - Normal builds have no third-party dependencies. The sole direct
   dev-dependency is `reed-solomon-erasure` with `simd-accel` for comparison.
 - No custom rustfmt/clippy config or Cargo aliases exist; use the commands above.
-- `FFF_BACKEND` requests can be ignored when unavailable. A green forced run is
-  not proof that an incapable host executed that ISA; inspect reported backend
-  or direct-kernel skip output.
+- `SIMD_BACKEND` requests can be ignored when unavailable. A green forced run
+  is not proof that an incapable host executed that ISA; inspect reported
+  backend or direct-kernel skip output.
 - The committed `Cargo.lock` is Cargo-generated; do not edit it manually.
 - `/target` and `/external-bench` are ignored. Crate packaging also excludes
   `/external-bench` and `/.github`.

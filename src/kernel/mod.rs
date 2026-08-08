@@ -76,6 +76,11 @@ mod tests;
 
 use crate::field::Field;
 
+// Only the SIMD-enabled resolve path consults the environment; under a
+// std-less build `backend()` reports `Scalar` without touching `Selection`.
+#[cfg(feature = "simd")]
+use simdispatch::Selection;
+
 mod private {
     pub trait Sealed {}
 }
@@ -88,234 +93,84 @@ impl private::Sealed for crate::field::fan_paar::FanPaar16 {}
 impl private::Sealed for crate::field::fan_paar::FanPaar32 {}
 impl private::Sealed for crate::field::fan_paar::FanPaar64 {}
 
-/// The instruction set the vector kernels run on.
+// The backend ladder is owned by `simdispatch` (the Level 0 single source for
+// detection and ordering); FFF re-exports it so downstream consumers keep
+// compiling, and builds its own `Selection` over the tiers it implements.
+pub use simdispatch::{Backend, ParseBackendError};
+
+/// The tiers FFF implements kernels for, in detection-preference order: the
+/// common ladder minus the x86 `V1` floor (FFF's 16-byte multiply kernels
+/// require SSSE3, not plain SSE2, so a V1-only host resolves to
+/// [`Backend::Scalar`]) and minus the deferred 64-byte AVX-512 tier (V4x,
+/// fff's `avx512.rs` kernels are cross-compile-only and not validated).
+pub const FFF_TIERS: &[Backend] = &[
+    Backend::V3GfniCrypto,
+    Backend::V3,
+    Backend::V2,
+    Backend::NeonAes,
+    Backend::Neon,
+    Backend::Wasm128,
+    Backend::Scalar,
+];
+
+/// FFF's kernel-policy questions over the shared ladder.
 ///
-/// Ordered by capability: earlier variants subsume later ones, and detection
-/// picks the first available.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[non_exhaustive]
-pub enum Backend {
-    /// x86 AVX-512F + AVX-512BW + GFNI. Native field multiply over 64 byte
-    /// lanes, with 32 architectural vector registers for blocked kernels.
-    Avx512,
-    /// x86 AVX2 + GFNI. One `GF2P8MULB` performs 32 field multiplies in the
-    /// crate's GF(2^8) polynomial directly, with no table in the loop.
-    Gfni,
-    /// x86 AVX2 split-nibble shuffle over 32-byte lanes.
-    Avx2,
-    /// x86 SSSE3 split-nibble shuffle over 16-byte lanes.
-    Ssse3,
-    /// `AArch64` NEON + PMULL. Everything [`Backend::Neon`] does, plus
-    /// `PMULL` for the one shape it wins: a varying operand pair, where the
-    /// alternative is eight bit-serial rounds. Fixed coefficients still use
-    /// the nibble shuffle, which PMULL's reduction network cannot match.
-    /// Detecting the extension once, here, is what keeps
-    /// [`FieldKernels::mul_elementwise`] from probing it per call.
-    Pmull,
-    /// `AArch64` NEON split-nibble shuffle over 16-byte lanes.
-    Neon,
-    /// WebAssembly `simd128` split-nibble shuffle over 16-byte lanes.
-    Simd128,
-    /// Portable scalar fallback. Always correct, always available.
-    Scalar,
-}
-
-impl Backend {
-    /// Every backend identifier, in detection-preference order.
-    pub const ALL: [Self; 8] = [
-        Self::Avx512,
-        Self::Gfni,
-        Self::Avx2,
-        Self::Ssse3,
-        Self::Pmull,
-        Self::Neon,
-        Self::Simd128,
-        Self::Scalar,
-    ];
-
-    /// Probe the host for the best available backend.
-    ///
-    /// Prefer [`backend()`], which caches this.
-    #[must_use]
-    pub fn detect() -> Self {
-        #[cfg(feature = "simd")]
-        {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            {
-                if std::is_x86_feature_detected!("avx512f")
-                    && std::is_x86_feature_detected!("avx512bw")
-                    && std::is_x86_feature_detected!("gfni")
-                {
-                    return Self::Avx512;
-                }
-                if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("gfni") {
-                    return Self::Gfni;
-                }
-                if std::is_x86_feature_detected!("avx2") {
-                    return Self::Avx2;
-                }
-                if std::is_x86_feature_detected!("ssse3") {
-                    return Self::Ssse3;
-                }
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                // NEON is baseline; PMULL rides in the optional crypto
-                // extension. Probing it here rather than per call is the whole
-                // point of caching a backend.
-                if std::arch::is_aarch64_feature_detected!("neon") {
-                    if std::arch::is_aarch64_feature_detected!("pmull") {
-                        return Self::Pmull;
-                    }
-                    return Self::Neon;
-                }
-            }
-            #[cfg(target_arch = "wasm32")]
-            if cfg!(target_feature = "simd128") {
-                return Self::Simd128;
-            }
-        }
-        Self::Scalar
-    }
-
-    /// Whether this backend has a native byte-wide field multiply.
-    #[inline]
-    #[must_use]
-    pub const fn has_native_mul(self) -> bool {
-        matches!(self, Self::Avx512 | Self::Gfni)
-    }
+/// `simdispatch::Backend` is capability; these two derive from the kernels
+/// this crate actually implements, so they stay here (field-kernel policy,
+/// not hardware facts). The ladder is owned upstream, so `Backend` gets these
+/// only through this trait.
+pub trait KernelBackend {
+    /// Whether this backend has a native byte-wide field multiply (GFNI).
+    fn has_native_mul(self) -> bool;
 
     /// Whether this backend implements the register-blocked multi-row
     /// kernels. Others decompose into repeated single-row AXPY.
+    fn has_blocked_rows(self) -> bool;
+}
+
+impl KernelBackend for Backend {
     #[inline]
-    #[must_use]
-    pub const fn has_blocked_rows(self) -> bool {
-        matches!(self, Self::Avx512 | Self::Gfni | Self::Neon | Self::Pmull)
+    fn has_native_mul(self) -> bool {
+        matches!(self, Backend::V3GfniCrypto)
     }
 
-    /// Vector width in bytes.
     #[inline]
-    #[must_use]
-    pub const fn lane_bytes(self) -> usize {
-        match self {
-            Self::Avx512 => 64,
-            Self::Gfni | Self::Avx2 => 32,
-            Self::Ssse3 | Self::Neon | Self::Pmull | Self::Simd128 => 16,
-            Self::Scalar => 8,
-        }
-    }
-
-    /// Short stable identifier, also the value accepted by `FFF_BACKEND`.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Avx512 => "avx512",
-            Self::Gfni => "gfni",
-            Self::Avx2 => "avx2",
-            Self::Ssse3 => "ssse3",
-            Self::Pmull => "pmull",
-            Self::Neon => "neon",
-            Self::Simd128 => "simd128",
-            Self::Scalar => "scalar",
-        }
-    }
-
-    /// Parse a backend name, as accepted by the `FFF_BACKEND` override.
-    #[must_use]
-    pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "avx512" => Self::Avx512,
-            "gfni" => Self::Gfni,
-            "avx2" => Self::Avx2,
-            "ssse3" => Self::Ssse3,
-            "pmull" => Self::Pmull,
-            "neon" => Self::Neon,
-            "simd128" => Self::Simd128,
-            "scalar" => Self::Scalar,
-            _ => return None,
-        })
-    }
-
-    #[cfg(any(feature = "std", test))]
-    #[inline]
-    const fn is_for_current_arch(self) -> bool {
-        match self {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            Self::Avx512 | Self::Gfni | Self::Avx2 | Self::Ssse3 => true,
-            #[cfg(target_arch = "aarch64")]
-            Self::Neon | Self::Pmull => true,
-            #[cfg(target_arch = "wasm32")]
-            Self::Simd128 => true,
-            Self::Scalar => true,
-            _ => false,
-        }
-    }
-}
-impl core::fmt::Display for Backend {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(self.name())
+    fn has_blocked_rows(self) -> bool {
+        matches!(
+            self,
+            Backend::V3GfniCrypto | Backend::Neon | Backend::NeonAes
+        )
     }
 }
 
-/// Error returned when a backend name is not recognized.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ParseBackendError;
-
-impl core::fmt::Display for ParseBackendError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("unknown fff backend")
-    }
-}
-
-impl core::str::FromStr for Backend {
-    type Err = ParseBackendError;
-
-    fn from_str(name: &str) -> Result<Self, Self::Err> {
-        Self::from_name(name).ok_or(ParseBackendError)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for ParseBackendError {}
-
-#[cfg(feature = "std")]
-static BACKEND: std::sync::LazyLock<Backend> = std::sync::LazyLock::new(resolve_backend);
-
-#[cfg(feature = "std")]
-fn resolve_backend() -> Backend {
-    let detected = Backend::detect();
-    // Downgrade-only override, for differential testing and for operators who
-    // need to sidestep a misbehaving instruction path. Upgrades are refused:
-    // running AVX2 code on a CPU without AVX2 is undefined behaviour, not a
-    // configuration choice.
-    match std::env::var("FFF_BACKEND") {
-        Ok(name) => match Backend::from_name(name.trim()) {
-            Some(requested) if requested.is_for_current_arch() && requested >= detected => {
-                requested
-            }
-            _ => detected,
-        },
-        Err(_) => detected,
-    }
-}
-
-/// The backend these kernels use, detected once per process.
+/// The backend these kernels use, resolved once per process.
 ///
-/// May be downgraded at startup via the `FFF_BACKEND` environment variable
-/// (`avx512`, `gfni`, `avx2`, `ssse3`, `pmull`, `neon`, `simd128`, `scalar`).
-/// Requests for a backend the host cannot run are ignored.
+/// Runs [`Selection`] over [`FFF_TIERS`] — every tier this crate implements
+/// kernels for, or [`Backend::Scalar`] when SIMD is compiled out — then
+/// adjusted by the downgrade-only `SIMD_BACKEND` override. May be downgraded
+/// at startup via `SIMD_BACKEND` (`v3_gfni_crypto`, `v3`, `v2`, `neon_aes`,
+/// `neon`, `wasm128`, `scalar`); requests for a backend the host cannot run
+/// are ignored. Detection itself is `simdispatch`'s `archmage` `summon()`
+/// probe — the one probe in the stack.
 #[inline]
 #[must_use]
 pub fn backend() -> Backend {
-    #[cfg(feature = "std")]
+    #[cfg(feature = "simd")]
     {
         *BACKEND
     }
-    #[cfg(not(feature = "std"))]
+    #[cfg(not(feature = "simd"))]
     {
         Backend::Scalar
     }
 }
+
+/// Memoized [`Selection`] over [`FFF_TIERS`], so dispatch never touches the
+/// environment per call — a cache of the single-source resolve, not a second
+/// resolver.
+#[cfg(feature = "simd")]
+static BACKEND: std::sync::LazyLock<Backend> =
+    std::sync::LazyLock::new(|| Selection::new("SIMD_BACKEND").supports(FFF_TIERS).resolve());
 /// The backend used for a particular field.
 ///
 /// Wider polynomial towers and the Fan–Paar fields currently report
@@ -634,15 +489,13 @@ fn xor_impl(dst: &mut [u8], src: &[u8]) {
 
     match backend() {
         #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-        Backend::Avx512 => x86::avx512::xor(dst, src),
+        Backend::V3GfniCrypto | Backend::V3 => x86::xor_avx2(dst, src),
         #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-        Backend::Gfni | Backend::Avx2 => x86::xor_avx2(dst, src),
-        #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-        Backend::Ssse3 => x86::xor_sse2(dst, src),
+        Backend::V2 => x86::xor_sse2(dst, src),
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-        Backend::Neon | Backend::Pmull => aarch64::xor_neon(dst, src),
+        Backend::Neon | Backend::NeonAes => aarch64::xor_neon(dst, src),
         #[cfg(all(feature = "simd", target_arch = "wasm32"))]
-        Backend::Simd128 => wasm32::xor_simd128(dst, src),
+        Backend::Wasm128 => wasm32::xor_simd128(dst, src),
         _ => scalar::xor(dst, src),
     }
 }

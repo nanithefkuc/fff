@@ -18,6 +18,11 @@
 #![allow(unsafe_code)]
 #![allow(clippy::incompatible_msrv)]
 
+// The 64-byte AVX-512 kernels are the deferred V4x tier (cross-compile-only
+// today; not in the shared ladder until validated on executing hardware).
+// They compile only for `internals` experiments, where they are reachable
+// (and differentially tested on a host that has AVX-512).
+#[cfg(feature = "internals")]
 pub mod avx512;
 pub mod fan_paar;
 pub mod gf16;

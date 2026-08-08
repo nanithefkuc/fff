@@ -12,11 +12,12 @@ publish = false
 
 [features]
 default = ["std", "simd"]
-# Standard library. Required for runtime CPU feature detection and the
-# lazily-built shared table banks.
+# Standard library. Required for the lazily-built shared table banks and the
+# `simdispatch` runtime detection selected by `simd`.
 std = []
-# Runtime-dispatched SIMD kernels (AVX-512/GFNI/AVX2/SSSE3 on x86, NEON
-# and optional PMULL on AArch64, and `simd128` on Wasm).
+# Runtime-dispatched SIMD kernels: v3_gfni_crypto / v3 / v2 on x86 (the
+# 64-byte AVX-512 tier is deferred), neon_aes / neon on AArch64, and
+# `wasm128` on Wasm. Enabling also resolves the backend via `simdispatch`.
 simd = ["std"]
 # Expose the crate's internal kernel modules and preparation types for
 # downstream libraries that build directly on the kernels. This is not a
@@ -24,6 +25,11 @@ simd = ["std"]
 internals = []
 
 [dependencies]
+# Level 0 single source for SIMD capability selection: detection, ordering,
+# and the downgrade-only `SIMD_BACKEND` override are owned upstream. Pinned to
+# the `v0.0.0` tag (see simdispatch repo). Swap this rev with the dependent
+# consumers (cafft) in the same sitting.
+simdispatch = { git = "https://github.com/nanithefkuc/simdispatch", rev = "5940194107384953cd8cd9f45c8d902b26d5686e" }
 
 # Comparison benchmarks only; the C `simd-accel` path has no wasm sysroot, and
 # scoping it here keeps `cargo test --target wasm32-*` buildable.

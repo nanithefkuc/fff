@@ -85,6 +85,19 @@ fn gf16_coeffs() -> Vec<gf16::Elem> {
 const ROW_COUNTS: &[usize] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 13];
 const ROW_LENS: &[usize] = &[2, 16, 32, 34, 64, 66, 128, 300];
 
+/// Whether the host resolves to one of the tiers in `supported` — the shared
+/// substitute for the crate's old `std::is_*_feature_detected!` test gates.
+///
+/// Declare the tier(s) a kernel needs and ask `simdispatch`'s selection,
+/// keeping detection single-source. `SIMD_BACKEND` is honored, so
+/// `SIMD_BACKEND=scalar` also skips the SIMD kernel tests.
+fn host_supports(supported: &'static [crate::kernel::Backend]) -> bool {
+    simdispatch::Selection::new("SIMD_BACKEND")
+        .supports(supported)
+        .resolve()
+        != crate::kernel::Backend::Scalar
+}
+
 // ---------------------------------------------------------------------------
 // Generic differential drivers, shared by every architecture below.
 // ---------------------------------------------------------------------------
@@ -567,34 +580,6 @@ fn gf64_into_reference(dst: &mut [u8], coeff: gf64::Elem, src: &[u8]) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn backend_overrides_reject_foreign_architectures() {
-    use super::Backend;
-
-    assert!(Backend::Scalar.is_for_current_arch());
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        assert!(Backend::Avx512.is_for_current_arch());
-        assert!(Backend::Gfni.is_for_current_arch());
-        assert!(Backend::Avx2.is_for_current_arch());
-        assert!(Backend::Ssse3.is_for_current_arch());
-        assert!(!Backend::Neon.is_for_current_arch());
-        assert!(!Backend::Simd128.is_for_current_arch());
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        assert!(Backend::Neon.is_for_current_arch());
-        assert!(!Backend::Avx512.is_for_current_arch());
-        assert!(!Backend::Simd128.is_for_current_arch());
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        assert!(Backend::Simd128.is_for_current_arch());
-        assert!(!Backend::Avx512.is_for_current_arch());
-        assert!(!Backend::Neon.is_for_current_arch());
-    }
-}
-
-#[test]
 fn scalar_nibble_paths_match_the_generic_reference() {
     check_gf8_mul_add("gf8 nibble", |dst, table, src| {
         super::gf8::mul_add_nibble(dst, table, src);
@@ -630,9 +615,15 @@ fn tower_coefficient_derivation_is_self_consistent() {
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
 mod x86 {
     use super::*;
-    use crate::kernel::x86;
+    use crate::kernel::{Backend, x86};
 
+    // The 64-byte AVX-512 kernels are the deferred V4x tier (not in the
+    // ladder) and have no `Backend` to resolve, so this hardware gate stays a
+    // direct `is_x86_feature_detected!` — the one sanctioned exception. The
+    // kernels are experimental (`internals`) until a validated 512-bit GFNI
+    // kernel exists and V4x ships.
     #[test]
+    #[cfg(feature = "internals")]
     fn avx512_kernels_match_reference() {
         if !(std::is_x86_feature_detected!("avx512f")
             && std::is_x86_feature_detected!("avx512bw")
@@ -704,7 +695,7 @@ mod x86 {
 
     #[test]
     fn gfni_kernels_match_reference() {
-        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("gfni")) {
+        if !(host_supports(&[Backend::V3GfniCrypto])) {
             eprintln!("skipping: no AVX2+GFNI on this host");
             return;
         }
@@ -827,7 +818,7 @@ mod x86 {
 
     #[test]
     fn avx2_kernels_match_reference() {
-        if !std::is_x86_feature_detected!("avx2") {
+        if !host_supports(&[Backend::V3]) {
             eprintln!("skipping: no AVX2 on this host");
             return;
         }
@@ -969,7 +960,7 @@ mod x86 {
 
     #[test]
     fn ssse3_kernels_match_reference() {
-        if !std::is_x86_feature_detected!("ssse3") {
+        if !host_supports(&[Backend::V2]) {
             eprintln!("skipping: no SSSE3 on this host");
             return;
         }
@@ -1054,7 +1045,7 @@ mod x86 {
             let mut avx2 = want.clone();
             let mut sse2 = want.clone();
             scalar::xor(&mut want, &src);
-            if std::is_x86_feature_detected!("avx2") {
+            if host_supports(&[Backend::V3]) {
                 x86::xor_avx2(&mut avx2, &src);
                 assert_eq!(avx2, want, "avx2 xor: len {len}");
             }
@@ -1087,7 +1078,7 @@ mod x86 {
                 let table = scale_table(coeff);
                 let mut want = src.to_vec();
                 scalar::mul_assign::<gf8::Gf8>(&mut want, coeff);
-                if std::is_x86_feature_detected!("gfni") && std::is_x86_feature_detected!("avx2") {
+                if host_supports(&[Backend::V3GfniCrypto]) {
                     let got = &mut got[offset..offset + NT_LEN];
                     x86::gf8::mul_into_gfni(got, coeff, src);
                     assert_eq!(
@@ -1096,7 +1087,7 @@ mod x86 {
                         "gf8 gfni nt mul_into: coeff {coeff:?}"
                     );
                 }
-                if std::is_x86_feature_detected!("avx2") {
+                if host_supports(&[Backend::V3]) {
                     let got = &mut got[offset..offset + NT_LEN];
                     x86::gf8::mul_into_avx2(got, table, src);
                     assert_eq!(
@@ -1120,7 +1111,7 @@ mod x86 {
                 let tables = TowerTables::new(coeff);
                 let mut want = src.to_vec();
                 scalar::mul_assign::<gf16::Gf16>(&mut want, coeff);
-                if std::is_x86_feature_detected!("gfni") && std::is_x86_feature_detected!("avx2") {
+                if host_supports(&[Backend::V3GfniCrypto]) {
                     let got = &mut got[offset..offset + src.len()];
                     x86::gf16::mul_into_gfni(got, TowerCoeff::new(coeff), src);
                     assert_eq!(
@@ -1129,7 +1120,7 @@ mod x86 {
                         "gf16 gfni nt mul_into: coeff {coeff:?}"
                     );
                 }
-                if std::is_x86_feature_detected!("avx2") {
+                if host_supports(&[Backend::V3]) {
                     let got = &mut got[offset..offset + src.len()];
                     x86::gf16::mul_into_avx2(got, &tables, src);
                     assert_eq!(
@@ -1160,7 +1151,7 @@ mod x86 {
     fn aligned_scatter_matches_reference() {
         const ROW_LEN: usize = 4096;
 
-        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("gfni")) {
+        if !(host_supports(&[Backend::V3GfniCrypto])) {
             eprintln!("skipping: no AVX2+GFNI on this host");
             return;
         }
@@ -1217,11 +1208,11 @@ mod x86 {
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
 mod aarch64 {
     use super::*;
-    use crate::kernel::aarch64;
+    use crate::kernel::{Backend, aarch64};
 
     #[test]
     fn neon_kernels_match_reference() {
-        if !std::arch::is_aarch64_feature_detected!("neon") {
+        if !host_supports(&[Backend::Neon]) {
             eprintln!("skipping: no NEON on this host");
             return;
         }
@@ -1274,7 +1265,7 @@ mod aarch64 {
 
     #[test]
     fn pmull_kernels_match_reference() {
-        if !std::arch::is_aarch64_feature_detected!("pmull") {
+        if !host_supports(&[Backend::NeonAes]) {
             eprintln!("skipping: no AArch64 PMULL extension on this host");
             return;
         }

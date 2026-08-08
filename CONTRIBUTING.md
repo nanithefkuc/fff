@@ -26,13 +26,13 @@ Backend dispatch resolves once per process, so one run only covers the host's
 best backend. Sweep the weaker ones explicitly:
 
 ```sh
-FFF_BACKEND=avx2   cargo test
-FFF_BACKEND=ssse3  cargo test
-FFF_BACKEND=scalar cargo test
+SIMD_BACKEND=v3     cargo test
+SIMD_BACKEND=v2     cargo test
+SIMD_BACKEND=scalar cargo test
 ```
 
-`FFF_BACKEND` is downgrade-only: asking for a backend the host cannot execute
-is ignored rather than faked.
+`SIMD_BACKEND` (owned by `simdispatch`) is downgrade-only: asking for a
+backend the host cannot execute is ignored rather than faked.
 
 ## Benchmarks
 

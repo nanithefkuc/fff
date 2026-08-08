@@ -11,7 +11,10 @@ cargo bench --bench kernels
 cargo bench --bench compare
 ```
 
-Pin a weaker backend to measure a dispatch crossover:
+Pin a weaker backend to measure a dispatch crossover (commands recorded with
+the historical `FFF_BACKEND`; the override is now `SIMD_BACKEND`, owned by
+[`simdispatch`](https://github.com/nanithefkuc/simdispatch), with the tiers
+renamed: `avx2`→`v3`, `ssse3`→`v2`):
 
 ```sh
 FFF_BACKEND=avx2  cargo bench --bench kernels
@@ -140,9 +143,10 @@ not the kernel.
 
 ### PMULL against the nibble shuffle
 
-`Backend::Pmull` and `Backend::Neon` differ by dispatch alone, so
-`FFF_BACKEND=pmull` against `FFF_BACKEND=neon` in **one binary** is the
-cleanest A/B this crate has. Same device, one pinned big core, max of three
+`Backend::NeonAes` (was `Pmull`) and `Backend::Neon` differ by dispatch alone,
+so `SIMD_BACKEND=neon_aes` against `SIMD_BACKEND=neon` in **one binary** is
+the cleanest A/B this crate has (recorded with the historical
+`FFF_BACKEND=pmull`/`neon`). Same device, one pinned big core, max of three
 runs each:
 
 | Shape | `neon` | `pmull` | |
