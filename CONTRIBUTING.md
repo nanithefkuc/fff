@@ -57,6 +57,11 @@ The crate denies `missing_docs` and warns on `clippy::pedantic`, so new public
 items need doc comments. MSRV is 1.89 and is checked in CI; do not reach for
 newer standard-library APIs without raising it deliberately.
 
+Commit messages follow the ecosystem rule (umbrella `AGENTS.md`): subject at
+most ~10 words, no implementation detail (that goes in the PR and
+`CHANGELOG.md`), and no references to planning artifacts (`.plans/` milestone
+tags and the like).
+
 ## Adding a field
 
 A new field needs a `Field` + `Elem` impl in `src/field/`, a `FieldKernels`
